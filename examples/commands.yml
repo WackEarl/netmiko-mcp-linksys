@@ -4,7 +4,6 @@
 # Changes take effect only after a server restart (lru_cache).
 allowed_commands:
   - show system information
-  - show version
   - show clock
   - show privilege
   - show users

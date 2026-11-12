@@ -14,7 +14,6 @@ from netmiko_mcp_linksys.server import (
     save_config,
     show,
 )
-from netmiko_mcp_linksys.validation import ValidationError
 
 
 def test_port_set_admin_state_rejects_protected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -72,7 +71,7 @@ def test_save_config_tool() -> None:
 
 def test_show_missing_command_file(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("NETMIKO_MCP_COMMAND_FILE", raising=False)
-    result = show("show version")
+    result = show("show system information")
     assert "NETMIKO_MCP_COMMAND_FILE" in result
 
 

@@ -10,9 +10,10 @@ same allow/deny list format (`commands.yml`). Configuration tools send only
 fixed command sequences built by this wrapper; the model never supplies
 free-form config.
 
-**This is 0.1.0.** Validation and sequence building are covered by offline
-tests. A live SSH test against a switch has not been run yet. See
-[Untested assumptions](#untested-assumptions).
+**This is 0.1.1.** It includes the fixes from the first live test on an
+LGS328PC with firmware 1.01.02.02 (SSH with `ssh-rsa` via paramiko 4.0.0;
+login lands directly in privilege 15 with prompt `LGS328PC#`; no banner or
+second login prompt). See [Live-test status](#live-test-status).
 
 ## Install and run
 
@@ -20,7 +21,7 @@ The intended way to run this server is the packaged entrypoint, pinned to a
 tag:
 
 ```bash
-uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.0 netmiko-mcp-linksys
+uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1 netmiko-mcp-linksys
 ```
 
 From a local checkout:
@@ -39,7 +40,7 @@ A compatibility shim, `lgs_mcp.py`, exists only for the older hub invocation
 `python /config/netmiko/lgs_mcp.py`. That file is not a standalone
 implementation: it imports `netmiko_mcp_linksys`. Prefer the `uvx --from ...
 netmiko-mcp-linksys` entry above. If you must keep the old command, add
-`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.0` so the
+`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1` so the
 package is installed in that environment.
 
 ## Environment variables
@@ -53,7 +54,10 @@ package is installed in that environment.
 | `SWITCH_KNOWN_HOSTS` | yes (at tool call) | Path to an OpenSSH `known_hosts` file with the switch host key. System host keys are not used. |
 | `SWITCH_PROTECTED_PORTS` | yes before any disable / PoE-off | Comma-separated ports (e.g. `0/24,0/25`) that may not be shut down or have PoE disabled. If this variable is unset, empty, or contains an invalid port, disable and PoE-off fail closed (every port is refused). Enabling a port is still allowed. |
 | `NETMIKO_MCP_COMMAND_FILE` | yes for `show` and `port_overview` | Path to a `commands.yml` allow/deny list. See `examples/commands.yml`. Restart the server after edits (`lru_cache`). |
-| `SWITCH_AUDIT_LOG` | no | If set, append one JSON line per tool call. The file is created with mode `0600`. Passwords are redacted from parameters and results. |
+| `SWITCH_AUDIT_LOG` | no (recommended) | If set, append one JSON line per tool call. The file is created with mode `0600`. Passwords are redacted from parameters and results. There is no default path; unset means no audit (warned at startup). An unwritable path does not break tools: a warning goes to stderr and the result gets an `audit_warning:` line. |
+| `SWITCH_READ_TIMEOUT` | no | Seconds without new output before a command is given up. Also passed to netmiko as `read_timeout_override`. Default `60`, range `1`–`600`. |
+| `SWITCH_PAGING_OFF` | no | `1` (default) sends `configure terminal` / `set cli pagination off` / `end` at session start, best effort. `0` skips it; the pager loop handles paging either way. |
+| `SWITCH_SESSION_LOG` | no | Debug only. If set, netmiko appends a session log there (mode `0600`). netmiko masks the password (`no_log`) and only channel reads are recorded. The log does contain full show output (MAC/ARP tables, descriptions); unset it after debugging. An unwritable path disables the log with a warning. |
 
 Python 3.12 or newer is required.
 
@@ -70,7 +74,7 @@ is set to a valid list, disable and PoE-off are refused.
     "command": "uvx",
     "args": [
       "--python", "3.12",
-      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.0",
+      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1",
       "netmiko-mcp-linksys"
     ],
     "env": {
@@ -81,7 +85,8 @@ is set to a valid list, disable and PoE-off are refused.
       "SWITCH_KNOWN_HOSTS": "/config/netmiko/known_hosts",
       "SWITCH_PROTECTED_PORTS": "<uplink and management ports, e.g. 0/24>",
       "NETMIKO_MCP_COMMAND_FILE": "/config/netmiko/commands.yml",
-      "SWITCH_AUDIT_LOG": "/data/netmiko/audit.log",
+      "SWITCH_AUDIT_LOG": "/data/netmiko/switch-audit.log",
+      "SWITCH_READ_TIMEOUT": "60",
       "UV_CACHE_DIR": "/data/uv-cache",
       "UV_PYTHON_INSTALL_DIR": "/data/uv-python",
       "UV_TOOL_DIR": "/data/uv-tools",
@@ -92,6 +97,9 @@ is set to a valid list, disable and PoE-off are refused.
   }
 }
 ```
+
+Paths under `/config` are read-only inside the hub container; put the audit
+log (and an optional `SWITCH_SESSION_LOG`) under `/data`.
 
 Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 `SWITCH_KNOWN_HOSTS` yourself from a verified host key; do not use
@@ -117,10 +125,12 @@ Descriptions: 1–32 characters from `[A-Za-z0-9 ._-]`.
 
 - **Default deny** for `show`. Only commands listed in `allowed_commands` run;
   `denied_commands` always wins. The allow list does not expand abbreviations
-  (`sh ver` is not `show version`). See the netmiko-mcp 0.3.0 validator docs.
+  (`sh sys info` is not `show system information`). See the netmiko-mcp 0.3.0 validator docs.
   The wrapper also rejects `|`, `;`, and newlines before that filter runs
   (`allow_pipe` is not honoured).
 - **No free-form config.** Interface commands are built only by this package.
+  The only other config sequence is the fixed best-effort
+  `set cli pagination off` at session start (see [Paging](#paging)).
 - **No VLAN, reboot, or reset tools.**
 - **Protected ports, fail-closed.** `SWITCH_PROTECTED_PORTS` blocks
   `port_set_admin_state(enabled=False)` and `poe_set(enabled=False)` on those
@@ -135,27 +145,50 @@ Descriptions: 1–32 characters from `[A-Za-z0-9 ._-]`.
   `save_config`. In the hub, `save_config` must be gated by `unlock`.
 - **Audit log** records time, tool, parameters, allow/deny, and a short
   result. Passwords are redacted from parameters, results, and error text.
+  Audit failures never abort a tool; they are reported on stderr and as an
+  `audit_warning:` line in the result.
 - **paramiko 4.0.0** for `ssh-rsa`/SHA-1 host keys. Do not bump to 5.x
   without a live SSH check.
 
-## Untested assumptions
+## Paging
 
-These need a live test on the real switch before relying on the config tools:
+The LGS CLI (ISS-based firmware) pages long output. netmiko's `cisco_s300`
+driver sends `terminal datadump`, which this firmware does not honour, and
+`set cli pagination off` is rejected in privileged exec. This package
+therefore:
 
-- netmiko `cisco_s300` prompt handling, paging, and `fast_cli=False` against
-  this firmware.
-- Whether the login user is already in privileged exec, or an enable secret
-  is required (`SWITCH_ENABLE` is not implemented).
-- `send_config_set(..., exit_config_mode=True, cmd_verify=True)` and the
-  `configure terminal` / `end` dance the cisco_s300 driver uses.
-- Read-back commands `show interfaces gigabitethernet 0/N` and
-  `show power inline gigabitethernet 0/N` (syntax and useful fields).
-- Device error text actually contains `%`, `Invalid`, or `Error` (the
-  rejection heuristic).
-- `save` as a single privileged exec command, and its output.
-- 28 ports and PoE on `0/1`–`0/24` (true for LGS328PC; other LGS models differ).
-- paramiko 4.0.0 still negotiates `ssh-rsa`/SHA-1 with this switch.
-- Timing, SSH banners, and the first-login prompt.
+1. Tries `set cli pagination off` in Global Configuration mode
+   (`configure terminal` … `end`) at the start of each session, best effort.
+   A rejection only logs one warning. The setting is a CLI display option; it
+   would only persist if `save_config` is run afterwards. Set
+   `SWITCH_PAGING_OFF=0` to skip it.
+2. Runs every exec command (`show`, read-backs, `save`) through its own read
+   loop: when the last visible line is a pager prompt (`--More--`,
+   `-- More --`, `--More-- (NN%)`, `More: <space>, Quit: q …`,
+   `<--- More --->`, `Press any key to continue`) it sends one space, and it
+   finishes on the real prompt (`<hostname>#`). Pager text, backspaces, ANSI
+   sequences, the command echo, and the trailing prompt are stripped.
+3. Gives up after `SWITCH_READ_TIMEOUT` seconds without new output. The error
+   contains the last visible line, so an unknown pager prompt can be added.
+
+## Live-test status
+
+Confirmed on LGS328PC, firmware 1.01.02.02 (0.1.0 live test):
+
+- paramiko 4.0.0 negotiates `ssh-rsa`/SHA-1; strict host-key check works.
+- Login lands directly in privilege 15 (`LGS328PC#`); no enable needed, no
+  banner, no second login prompt.
+- `show version` does not exist; use `show system information`.
+- Read-back `show power inline gigabitethernet 0/N` works.
+- Invalid commands return `%` / `Invalid` (the error heuristic).
+
+Still to confirm with 0.1.1:
+
+- Long outputs through the pager loop, and the exact pager prompt text.
+- Whether `set cli pagination off` in config mode is accepted.
+- Read-back `show interfaces gigabitethernet 0/N`.
+- `send_config_set` with `configure terminal` / `end` for the interface
+  tools, and the output of `save`.
 - Hub `unlock` behaviour for `save_config`.
 
 ## Development

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from netmiko_mcp_linksys.server import prepare_runtime, show
+from netmiko_mcp_linksys.server import show
 from netmiko_mcp_linksys.validation import (
     ValidationError,
     parse_protected_ports,
@@ -67,8 +67,8 @@ def test_invalid_descriptions(text: str) -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        "show version",
         "show system information",
+        "show clock",
         "show vlan",
         "show power inline gigabitethernet 0/1",
         "show interfaces",
@@ -132,10 +132,10 @@ def test_protected_ports_fail_closed_on_invalid_entry(monkeypatch: pytest.Monkey
 @pytest.mark.parametrize(
     "command",
     [
-        "show version | include Software",
-        "show version; shutdown",
-        "show version\nreload",
-        "show version\rshutdown",
+        "show system information | include Software",
+        "show system information; shutdown",
+        "show system information\nreload",
+        "show system information\rshutdown",
     ],
 )
 def test_show_rejects_pipe_semicolon_newlines(
@@ -152,9 +152,9 @@ def test_show_rejects_pipe_semicolon_newlines(
 
 def test_reject_unsafe_show_command_direct() -> None:
     with pytest.raises(ValidationError, match=r"'\|', ';', and newlines"):
-        reject_unsafe_show_command("show version | include x")
+        reject_unsafe_show_command("show system information | include x")
     with pytest.raises(ValidationError, match="not allowed"):
-        reject_unsafe_show_command("show version; shutdown")
+        reject_unsafe_show_command("show system information; shutdown")
     with pytest.raises(ValidationError, match="not allowed"):
-        reject_unsafe_show_command("show version\nreload")
-    assert reject_unsafe_show_command("show version") == "show version"
+        reject_unsafe_show_command("show system information\nreload")
+    assert reject_unsafe_show_command("show system information") == "show system information"

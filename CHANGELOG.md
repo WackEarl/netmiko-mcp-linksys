@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-11-12
+
+Fixes from the first live test on an LGS328PC (firmware 1.01.02.02).
+
+### Fixed
+
+- Long `show` outputs (`show interfaces`, `show interfaces status`,
+  `show power inline`, `show spanning-tree`, `show mac-address-table`, and the
+  `show interfaces gigabitethernet 0/N` read-back) no longer fail with
+  `Pattern not detected`. Exec commands now run through a pager-aware read
+  loop that answers `--More--`-style prompts with a space, waits for the real
+  prompt, and strips pager text, backspaces, and ANSI sequences. Read-backs
+  and `save` use the same loop.
+- An unwritable audit log (for example `OSError: [Errno 30] Read-only file
+  system`) no longer aborts the tool. The failure is written to stderr and
+  appended to the tool result as an `audit_warning:` line.
+
+### Added
+
+- Best-effort paging-off at session start: `configure terminal`,
+  `set cli pagination off`, `end`. On this ISS-based CLI the command only
+  exists in Global Configuration mode; if it is rejected, the pager loop still
+  handles paging. Disable with `SWITCH_PAGING_OFF=0`.
+- `SWITCH_READ_TIMEOUT` (default 60 s, 1–600): idle timeout of the read loop
+  and netmiko `read_timeout_override`.
+- `SWITCH_SESSION_LOG`: optional netmiko session log (append, mode 0600,
+  password masked by netmiko's `no_log`, writes not recorded). An unwritable
+  path disables the log with a warning.
+- Startup check: warns on stderr when `SWITCH_AUDIT_LOG` is unset or not
+  writable, when `SWITCH_READ_TIMEOUT` is invalid, or when `SWITCH_SESSION_LOG`
+  is not writable. Startup never aborts and never contacts the switch.
+
+### Changed
+
+- `examples/commands.yml`: removed `show version` (invalid on this firmware);
+  use `show system information`.
+- README example audit path is now `/data/netmiko/switch-audit.log`.
+
 ## [0.1.0] - 2026-11-12
 
 ### Added

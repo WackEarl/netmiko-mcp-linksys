@@ -66,6 +66,8 @@ def test_connect_params_from_env() -> None:
     assert params["conn_timeout"] == 15
     assert params["auth_timeout"] == 20
     assert params["fast_cli"] is False
+    assert params["read_timeout_override"] == 60.0
+    assert "session_log" not in params
 
 
 def test_connect_params_missing_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -74,50 +76,63 @@ def test_connect_params_missing_env(monkeypatch: pytest.MonkeyPatch) -> None:
         connect_params()
 
 
-def test_run_show_uses_send_command_without_textfsm() -> None:
+def test_run_show_uses_pager_loop() -> None:
     conn = MagicMock()
-    conn.send_command.return_value = "VERSION"
-    with patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn) as ch:
-        assert run_show("show version") == "VERSION"
+    with (
+        patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn) as ch,
+        patch("netmiko_mcp_linksys.connection.send_paged", return_value="INFO") as paged,
+    ):
+        assert run_show("show system information") == "INFO"
     ch.assert_called_once()
-    conn.send_command.assert_called_once_with("show version", use_textfsm=False)
+    paged.assert_called_once_with(conn, "show system information")
+    conn.send_command.assert_not_called()
     conn.disconnect.assert_called_once()
 
 
 def test_run_config_and_readback() -> None:
     conn = MagicMock()
     conn.send_config_set.return_value = "ok"
-    conn.send_command.return_value = "STATE"
     commands = build_admin_state_commands("0/1", False)
     readback = READBACK_INTERFACE.format(port="0/1")
-    with patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn):
+    with (
+        patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn),
+        patch("netmiko_mcp_linksys.connection.send_paged", return_value="STATE") as paged,
+    ):
         result = run_config_and_readback(commands, readback)
-    conn.send_config_set.assert_called_once_with(
-        commands, exit_config_mode=True, cmd_verify=True
-    )
-    conn.send_command.assert_called_once_with(readback, use_textfsm=False)
+    # call 0: best-effort paging-off, call 1: the interface sequence
+    assert conn.send_config_set.call_args_list[0].args[0] == ["set cli pagination off"]
+    assert conn.send_config_set.call_args_list[1].args[0] == commands
+    assert conn.send_config_set.call_args_list[1].kwargs["cmd_verify"] is True
+    assert conn.send_config_set.call_args_list[1].kwargs["exit_config_mode"] is True
+    paged.assert_called_once_with(conn, readback)
     conn.disconnect.assert_called_once()
     assert "STATE" in result
     assert readback in result
 
 
-def test_run_config_rejects_device_error() -> None:
+def test_run_config_rejects_device_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SWITCH_PAGING_OFF", "0")
     conn = MagicMock()
     conn.send_config_set.return_value = "% Invalid input detected"
     with patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn):
-        from netmiko_mcp_linksys.connection import ConnectionError as SwitchConnectionError
+        from netmiko_mcp_linksys.connection import (
+            ConnectionError as SwitchConnectionError,
+        )
 
         with pytest.raises(SwitchConnectionError, match="rejected"):
             run_config_and_readback(build_poe_commands("0/1", True), READBACK_POE.format(port="0/1"))
-    conn.send_command.assert_not_called()
+    conn.write_channel.assert_not_called()
 
 
-def test_run_save_sends_only_save() -> None:
+def test_run_save_sends_only_save(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SWITCH_PAGING_OFF", "0")
     conn = MagicMock()
-    conn.send_command.return_value = "success"
-    with patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn):
+    with (
+        patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn),
+        patch("netmiko_mcp_linksys.connection.send_paged", return_value="success") as paged,
+    ):
         assert run_save() == "success"
-    conn.send_command.assert_called_once_with("save", use_textfsm=False)
+    paged.assert_called_once_with(conn, "save")
     conn.send_config_set.assert_not_called()
 
 
@@ -129,5 +144,5 @@ def test_password_redacted_from_connection_error() -> None:
         side_effect=RuntimeError("auth failed for dummy-password-not-real"),
     ):
         with pytest.raises(SwitchConnectionError, match=r"\*\*\*") as excinfo:
-            run_show("show version")
+            run_show("show system information")
     assert "dummy-password-not-real" not in str(excinfo.value)

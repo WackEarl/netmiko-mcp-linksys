@@ -3,13 +3,13 @@
 
 The intended installation path is the packaged entrypoint:
 
-    uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.0 netmiko-mcp-linksys
+    uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1 netmiko-mcp-linksys
 
 This file is not a standalone implementation. The `netmiko-mcp-linksys`
 package must be installed in the same environment. For the older
 `uv run --no-project --with ... python /config/netmiko/lgs_mcp.py` form, add:
 
-    --with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.0
+    --with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1
 """
 
 from __future__ import annotations

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -14,17 +15,21 @@ from netmiko_mcp.security import (
     validate_command,
 )
 
-from netmiko_mcp_linksys.audit import write_audit
+from netmiko_mcp_linksys.audit import check_audit_path, write_audit
 from netmiko_mcp_linksys.connection import (
     READBACK_INTERFACE,
     READBACK_POE,
-    ConnectionError as SwitchConnectionError,
     build_admin_state_commands,
     build_description_commands,
     build_poe_commands,
+    read_timeout,
     run_config_and_readback,
     run_save,
     run_show,
+    session_log_path,
+)
+from netmiko_mcp_linksys.connection import (
+    ConnectionError as SwitchConnectionError,
 )
 from netmiko_mcp_linksys.validation import (
     ValidationError,
@@ -72,15 +77,37 @@ def prepare_runtime() -> None:
     build_abbreviation_filter.cache_clear()
 
 
+def _with_audit_warning(text: str, warning: str | None) -> str:
+    if not warning:
+        return text
+    return f"{text}\n\naudit_warning: {warning}"
+
+
 def _fail(tool: str, params: dict[str, Any], message: str, *, allowed: bool) -> str:
     text = redact_secrets(message)
-    write_audit(tool=tool, params=params, allowed=allowed, result=text)
-    return text
+    warning = write_audit(tool=tool, params=params, allowed=allowed, result=text)
+    return _with_audit_warning(text, warning)
 
 
 def _ok(tool: str, params: dict[str, Any], result: str) -> str:
-    write_audit(tool=tool, params=params, allowed=True, result="ok")
-    return result
+    warning = write_audit(tool=tool, params=params, allowed=True, result="ok")
+    return _with_audit_warning(result, warning)
+
+
+def startup_checks() -> list[str]:
+    """Check local paths and settings at start. Warn on stderr, never abort,
+    never contact the switch."""
+    warnings: list[str] = []
+    audit_warning = check_audit_path()
+    if audit_warning:
+        warnings.append(audit_warning)
+    try:
+        read_timeout()
+    except ValidationError as exc:
+        warnings.append(str(exc))
+        print(f"netmiko-mcp-linksys: warning: {exc}", file=sys.stderr, flush=True)
+    session_log_path()
+    return warnings
 
 
 @mcp.tool()
@@ -225,6 +252,7 @@ def save_config() -> str:
 def main() -> None:
     """Start the stdio MCP server. Does not open an SSH session."""
     prepare_runtime()
+    startup_checks()
     mcp.run(transport="stdio")
 
 

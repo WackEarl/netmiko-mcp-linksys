@@ -1,4 +1,4 @@
-"""SSH session handling and CLI sequence builders.
+"""SSH session handling, pager handling, and CLI sequence builders.
 
 No connection is opened at import or process start. Each tool call opens one
 session, holds a process-wide lock for the duration, and disconnects after.
@@ -7,7 +7,10 @@ session, holds a process-wide lock for the duration, and disconnects after.
 from __future__ import annotations
 
 import os
+import re
+import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,9 +29,95 @@ _LOCK = threading.Lock()
 READBACK_INTERFACE = "show interfaces gigabitethernet {port}"
 READBACK_POE = "show power inline gigabitethernet {port}"
 
+DEFAULT_READ_TIMEOUT = 60.0
+MAX_READ_TIMEOUT = 600.0
+
+# Best-effort paging-off for the Aricent/ISS-based LGS CLI. On ISS-family
+# firmware this is a Global Configuration command (it is rejected in
+# privileged exec, which is what the 0.1.0 live test hit). The result is not
+# trusted: the pager loop below handles paging either way.
+PAGING_OFF_CONFIG = ("set cli pagination off",)
+
+# Pager prompts seen on ISS / Cisco-SMB style CLIs, e.g. "--More--",
+# "-- More --", "--More-- (45%)", "More: <space>,  Quit: q ...",
+# "<--- More --->", "Press any key to continue (Q to quit)".
+PAGER_RE = re.compile(
+    r"(?:"
+    r"-{2,}\s*\(?\s*more\s*\)?\s*-{2,}(?:\s*\(\d{1,3}%\))?"
+    r"|<-+\s*more\s*-+>"
+    r"|more:\s*<space>(?:[^\r\n]*?<return>)?"
+    r"|press any key to continue(?:\s*\([^()\r\n]{0,40}\))?"
+    r")",
+    re.IGNORECASE,
+)
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Za-z0-9]|\x1b[=>78DEM]")
+MAX_PAGES = 2000
+
+_warned: set[str] = set()
+
 
 class ConnectionError(RuntimeError):
     """Switch connection or CLI execution failed. Message is already redacted."""
+
+
+def warn(message: str, *, once_key: str | None = None) -> None:
+    """Write a redacted warning to stderr (stdout is the MCP channel)."""
+    if once_key is not None:
+        if once_key in _warned:
+            return
+        _warned.add(once_key)
+    print(f"netmiko-mcp-linksys: warning: {redact_secrets(message)}", file=sys.stderr, flush=True)
+
+
+def read_timeout() -> float:
+    raw = (os.environ.get("SWITCH_READ_TIMEOUT") or "").strip()
+    if not raw:
+        return DEFAULT_READ_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValidationError(
+            f"SWITCH_READ_TIMEOUT must be a number of seconds, got {raw!r}."
+        ) from None
+    if not 1 <= value <= MAX_READ_TIMEOUT:
+        raise ValidationError(
+            f"SWITCH_READ_TIMEOUT must be between 1 and {int(MAX_READ_TIMEOUT)} seconds."
+        )
+    return value
+
+
+def paging_off_enabled() -> bool:
+    raw = (os.environ.get("SWITCH_PAGING_OFF") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def prepare_private_file(path_str: str) -> Path:
+    """Create (if needed) an append-only file with mode 0600, or raise OSError."""
+    path = Path(path_str).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = not path.exists()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        if created:
+            os.chmod(path, 0o600)
+    finally:
+        os.close(fd)
+    return path
+
+
+def session_log_path() -> str | None:
+    """Return a writable SWITCH_SESSION_LOG path, or None (never raises)."""
+    raw = (os.environ.get("SWITCH_SESSION_LOG") or "").strip()
+    if not raw:
+        return None
+    try:
+        return str(prepare_private_file(raw))
+    except OSError as exc:
+        warn(
+            f"SWITCH_SESSION_LOG {raw} is not writable ({exc}); session log disabled.",
+            once_key=f"session-log:{raw}",
+        )
+        return None
 
 
 def connect_params() -> dict[str, Any]:
@@ -57,7 +146,7 @@ def connect_params() -> dict[str, Any]:
             f"SWITCH_KNOWN_HOSTS file does not exist: {known_hosts}"
         )
 
-    return {
+    params: dict[str, Any] = {
         "device_type": device_type,
         "host": host,
         "username": username,
@@ -71,7 +160,37 @@ def connect_params() -> dict[str, Any]:
         "conn_timeout": 15,
         "auth_timeout": 20,
         "fast_cli": False,
+        "read_timeout_override": read_timeout(),
     }
+    log_path = session_log_path()
+    if log_path is not None:
+        # netmiko masks the password/secret in the session log (no_log), and
+        # only channel reads are recorded (record_writes stays False).
+        params["session_log"] = log_path
+        params["session_log_file_mode"] = "append"
+        params["session_log_record_writes"] = False
+    return params
+
+
+def disable_paging_best_effort(conn: Any) -> None:
+    """Try the ISS paging-off command; never fail the tool call because of it."""
+    if not paging_off_enabled():
+        return
+    try:
+        output = conn.send_config_set(
+            list(PAGING_OFF_CONFIG),
+            exit_config_mode=True,
+            cmd_verify=False,
+            read_timeout=read_timeout(),
+        )
+    except Exception as exc:
+        warn(f"paging-off sequence failed ({exc}); relying on pager handling.", once_key="paging")
+        return
+    if config_output_is_error(str(output)):
+        warn(
+            "switch rejected 'set cli pagination off'; relying on pager handling.",
+            once_key="paging",
+        )
 
 
 @contextmanager
@@ -82,8 +201,11 @@ def session() -> Iterator[Any]:
         conn = None
         try:
             conn = ConnectHandler(**params)
+            disable_paging_best_effort(conn)
             yield conn
         except ValidationError:
+            raise
+        except ConnectionError:
             raise
         except Exception as exc:
             raise ConnectionError(redact_secrets(str(exc))) from None
@@ -93,6 +215,113 @@ def session() -> Iterator[Any]:
                     conn.disconnect()
                 except Exception:
                     pass
+
+
+def _apply_backspaces(text: str) -> str:
+    if "\b" not in text:
+        return text
+    out: list[str] = []
+    for char in text:
+        if char == "\b":
+            if out and out[-1] != "\n":
+                out.pop()
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def _prompt_regex(conn: Any) -> re.Pattern[str]:
+    base = getattr(conn, "base_prompt", None)
+    if isinstance(base, str) and base.strip():
+        return re.compile(r"^\s*" + re.escape(base.strip()) + r"[^\r\n#>]*[#>]\s*$")
+    return re.compile(r"^\s*[\w.\-]+[^\r\n#>]*[#>]\s*$")
+
+
+def _visible_tail(raw: str) -> str:
+    """Last unterminated line as the terminal would show it."""
+    text = _apply_backspaces(ANSI_RE.sub("", raw))
+    line = text.rsplit("\n", 1)[-1]
+    if "\r" in line:
+        segments = [seg for seg in line.split("\r") if seg.strip()]
+        line = segments[-1] if segments else ""
+    return line
+
+
+def clean_output(raw: str, command: str, prompt_re: re.Pattern[str]) -> str:
+    """Strip ANSI, backspaces, pager prompts, the command echo, and the prompt."""
+    text = _apply_backspaces(ANSI_RE.sub("", raw))
+    text = PAGER_RE.sub("", text)
+    text = text.replace("\r\n", "\n")
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if "\r" in line:
+            segments = [seg for seg in line.split("\r") if seg.strip()]
+            line = segments[-1] if segments else ""
+        lines.append(line.rstrip())
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and command.strip() and command.strip() in lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and prompt_re.search(lines[-1]):
+        lines.pop()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def send_paged(
+    conn: Any,
+    command: str,
+    *,
+    timeout: float | None = None,
+    poll_interval: float = 0.1,
+) -> str:
+    """Send one exec command and read until the prompt, paging through pagers.
+
+    Each time the last visible line matches PAGER_RE a single space is sent.
+    Finishes when the last visible line is the device prompt. ``timeout`` is
+    an idle timeout: the seconds allowed without any new output.
+    """
+    limit = read_timeout() if timeout is None else timeout
+    prompt_re = _prompt_regex(conn)
+    try:
+        conn.clear_buffer()
+    except Exception:
+        pass
+    conn.write_channel(command + getattr(conn, "RETURN", "\n"))
+    buffer = ""
+    scan_from = 0
+    pages = 0
+    deadline = time.monotonic() + limit
+    while True:
+        chunk = conn.read_channel()
+        if chunk:
+            buffer += chunk
+            deadline = time.monotonic() + limit
+            tail = _visible_tail(buffer[scan_from:])
+            if PAGER_RE.search(tail):
+                pages += 1
+                if pages > MAX_PAGES:
+                    raise ConnectionError(f"Gave up after {MAX_PAGES} pager pages for {command!r}.")
+                # Drop the pager line itself; PAGER_RE in clean_output is only
+                # a fallback for prompts that are echoed elsewhere.
+                cut = buffer.rfind("\n", scan_from)
+                buffer = buffer[: cut + 1] if cut >= 0 else buffer[:scan_from]
+                conn.write_channel(" ")
+                scan_from = len(buffer)
+                continue
+            if "\n" in buffer and prompt_re.search(tail):
+                return clean_output(buffer, command, prompt_re)
+        elif time.monotonic() > deadline:
+            last = _visible_tail(buffer)[-80:]
+            raise ConnectionError(
+                f"No prompt after {command!r} ({limit:g}s without new output, "
+                f"pages: {pages}, last line: {redact_secrets(last)!r})."
+            )
+        else:
+            time.sleep(poll_interval)
 
 
 def build_admin_state_commands(port: str, enabled: bool) -> list[str]:
@@ -123,55 +352,47 @@ def build_description_commands(port: str, text: str | None) -> list[str]:
 def run_show(command: str) -> str:
     with session() as conn:
         try:
-            output = conn.send_command(command, use_textfsm=False)
+            return send_paged(conn, command)
+        except ConnectionError:
+            raise
         except Exception as exc:
             raise ConnectionError(redact_secrets(str(exc))) from None
-    return output if isinstance(output, str) else str(output)
+
+
+def _send_config(conn: Any, commands: list[str]) -> str:
+    try:
+        output = conn.send_config_set(
+            commands,
+            exit_config_mode=True,
+            cmd_verify=True,
+            read_timeout=read_timeout(),
+        )
+    except Exception as exc:
+        raise ConnectionError(redact_secrets(str(exc))) from None
+    text = output if isinstance(output, str) else str(output)
+    if config_output_is_error(text):
+        raise ConnectionError(
+            "Device rejected the configuration sequence:\n" + redact_secrets(text)
+        )
+    return text
 
 
 def run_config_set(commands: list[str]) -> str:
     with session() as conn:
-        try:
-            output = conn.send_config_set(
-                commands,
-                exit_config_mode=True,
-                cmd_verify=True,
-            )
-        except Exception as exc:
-            raise ConnectionError(redact_secrets(str(exc))) from None
-        if config_output_is_error(str(output)):
-            raise ConnectionError(
-                "Device rejected the configuration sequence:\n"
-                + redact_secrets(str(output))
-            )
-        return output if isinstance(output, str) else str(output)
+        return _send_config(conn, commands)
 
 
 def run_config_and_readback(commands: list[str], readback: str) -> str:
     """Apply a config set, then read the resulting state in the same session."""
     with session() as conn:
+        _send_config(conn, commands)
         try:
-            config_output = conn.send_config_set(
-                commands,
-                exit_config_mode=True,
-                cmd_verify=True,
-            )
-        except Exception as exc:
-            raise ConnectionError(redact_secrets(str(exc))) from None
-        config_text = config_output if isinstance(config_output, str) else str(config_output)
-        if config_output_is_error(config_text):
-            raise ConnectionError(
-                "Device rejected the configuration sequence:\n"
-                + redact_secrets(config_text)
-            )
-        try:
-            state = conn.send_command(readback, use_textfsm=False)
+            state_text = send_paged(conn, readback)
         except Exception as exc:
             raise ConnectionError(
                 "Configuration was sent, but read-back failed: "
                 + redact_secrets(str(exc))
             ) from None
-        state_text = state if isinstance(state, str) else str(state)
         return (
             "Configuration sent.\n"
             f"--- {readback} ---\n"
@@ -182,10 +403,11 @@ def run_config_and_readback(commands: list[str], readback: str) -> str:
 def run_save() -> str:
     with session() as conn:
         try:
-            output = conn.send_command("save", use_textfsm=False)
+            text = send_paged(conn, "save")
+        except ConnectionError:
+            raise
         except Exception as exc:
             raise ConnectionError(redact_secrets(str(exc))) from None
-    text = output if isinstance(output, str) else str(output)
     if config_output_is_error(text):
         raise ConnectionError("save failed:\n" + redact_secrets(text))
     return text
