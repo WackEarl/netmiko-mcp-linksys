@@ -50,7 +50,21 @@ PAGER_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][A-Za-z0-9]|\x1b[=>78DEM]")
+# CSI (ESC [ params intermediates final), OSC (ESC ] ... BEL/ST), charset
+# selection (ESC ( B), and the common two-byte ESC 7/8/=/>/D/E/H/M/c.
+# Any ESC left after this is dropped on its own (netmiko strips per read,
+# which can orphan an ESC).
+ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)?"
+    r"|\x1b[()#%][A-Za-z0-9]"
+    r"|\x1b[78=>DEHMc\\]"
+)
+# C0 controls other than \t, \n, \r, \b (handled separately), plus DEL.
+CONTROL_RE = re.compile(r"[\x00-\x07\x0b\x0c\x0e-\x1f\x7f]")
+# Marks where a pager prompt was cut; blank lines right after it are erase
+# leftovers (netmiko turns the pager's "\r    \r" into newlines).
+PAGE_BREAK = "\ue000"
 MAX_PAGES = 2000
 
 _warned: set[str] = set()
@@ -237,9 +251,17 @@ def _prompt_regex(conn: Any) -> re.Pattern[str]:
     return re.compile(r"^\s*[\w.\-]+[^\r\n#>]*[#>]\s*$")
 
 
+def _strip_controls(raw: str) -> str:
+    """Remove ANSI/VT100 sequences, orphaned ESC bytes, backspaces, and other
+    control characters (keeps \t, \n, \r and the PAGE_BREAK marker)."""
+    text = ANSI_RE.sub("", raw).replace("\x1b", "")
+    text = _apply_backspaces(text)
+    return CONTROL_RE.sub("", text)
+
+
 def _visible_tail(raw: str) -> str:
     """Last unterminated line as the terminal would show it."""
-    text = _apply_backspaces(ANSI_RE.sub("", raw))
+    text = _strip_controls(raw).replace(PAGE_BREAK, "")
     line = text.rsplit("\n", 1)[-1]
     if "\r" in line:
         segments = [seg for seg in line.split("\r") if seg.strip()]
@@ -248,16 +270,30 @@ def _visible_tail(raw: str) -> str:
 
 
 def clean_output(raw: str, command: str, prompt_re: re.Pattern[str]) -> str:
-    """Strip ANSI, backspaces, pager prompts, the command echo, and the prompt."""
-    text = _apply_backspaces(ANSI_RE.sub("", raw))
+    """Strip ANSI, control characters, pager prompts and their erase leftovers,
+    the command echo, and the prompt.
+
+    Blank lines directly after a page break are dropped; blank lines elsewhere
+    in the device output are kept.
+    """
+    text = _strip_controls(raw)
     text = PAGER_RE.sub("", text)
     text = text.replace("\r\n", "\n")
     lines: list[str] = []
+    after_break = False
     for line in text.split("\n"):
+        if PAGE_BREAK in line:
+            line = line.replace(PAGE_BREAK, "")
+            after_break = True
         if "\r" in line:
             segments = [seg for seg in line.split("\r") if seg.strip()]
             line = segments[-1] if segments else ""
-        lines.append(line.rstrip())
+        line = line.rstrip()
+        if after_break:
+            if not line.strip():
+                continue
+            after_break = False
+        lines.append(line)
     while lines and not lines[0].strip():
         lines.pop(0)
     if lines and command.strip() and command.strip() in lines[0]:
@@ -309,6 +345,7 @@ def send_paged(
                 # a fallback for prompts that are echoed elsewhere.
                 cut = buffer.rfind("\n", scan_from)
                 buffer = buffer[: cut + 1] if cut >= 0 else buffer[:scan_from]
+                buffer += PAGE_BREAK
                 conn.write_channel(" ")
                 scan_from = len(buffer)
                 continue
@@ -339,10 +376,14 @@ def build_poe_commands(port: str, enabled: bool) -> list[str]:
 
 
 def build_description_commands(port: str, text: str | None) -> list[str]:
+    """Always quote the text: the LGS CLI takes only one word unquoted.
+
+    validate_description() forbids quotes in the text, so quoting is safe.
+    """
     if text is None:
         inner = "no description"
     else:
-        inner = f"description {text}"
+        inner = f'description "{text}"'
     return [
         f"interface gigabitethernet {port}",
         inner,

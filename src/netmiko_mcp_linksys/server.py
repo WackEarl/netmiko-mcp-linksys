@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -221,6 +222,28 @@ def poe_set(port: str, enabled: bool) -> str:
     return _ok("poe_set", params, output)
 
 
+def description_readback_note(readback: str, text: str) -> str:
+    """Compare the read-back with the requested description (informational).
+
+    The command is sent quoted; the switch should store and show the text
+    without quotes. A quoted match means the quotes were stored literally.
+    """
+    # Only look at the device output, not the "--- <command> ---" header.
+    readback = readback.split(" ---\n", 1)[-1]
+    bounded = r"(?<![A-Za-z0-9._-]){}(?![A-Za-z0-9._-])"
+    if re.search(bounded.format(re.escape(f'"{text}"')), readback):
+        return (
+            "Read-back check: description appears WITH quotes; the switch "
+            "stored the quotes literally."
+        )
+    if re.search(bounded.format(re.escape(text)), readback):
+        return "Read-back check: description found in read-back (without quotes)."
+    return (
+        "Read-back check: description not visible in the read-back output; "
+        "this show command may not display descriptions."
+    )
+
+
 @mcp.tool()
 def port_set_description(port: str, text: str | None = None) -> str:
     """Set an interface description, or clear it when text is omitted. Does not save."""
@@ -231,6 +254,8 @@ def port_set_description(port: str, text: str | None = None) -> str:
             validate_description(text)
         commands = build_description_commands(port, text)
         output = run_config_and_readback(commands, READBACK_INTERFACE.format(port=port))
+        if text is not None:
+            output = f"{output}\n\n{description_readback_note(output, text)}"
     except ValidationError as exc:
         return _fail("port_set_description", params, f"Rejected: {exc}", allowed=False)
     except SwitchConnectionError as exc:

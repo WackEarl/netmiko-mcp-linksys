@@ -10,7 +10,7 @@ same allow/deny list format (`commands.yml`). Configuration tools send only
 fixed command sequences built by this wrapper; the model never supplies
 free-form config.
 
-**This is 0.1.1.** It includes the fixes from the first live test on an
+**This is 0.1.2.** It includes the fixes from the live tests on an
 LGS328PC with firmware 1.01.02.02 (SSH with `ssh-rsa` via paramiko 4.0.0;
 login lands directly in privilege 15 with prompt `LGS328PC#`; no banner or
 second login prompt). See [Live-test status](#live-test-status).
@@ -21,7 +21,7 @@ The intended way to run this server is the packaged entrypoint, pinned to a
 tag:
 
 ```bash
-uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1 netmiko-mcp-linksys
+uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.2 netmiko-mcp-linksys
 ```
 
 From a local checkout:
@@ -40,7 +40,7 @@ A compatibility shim, `lgs_mcp.py`, exists only for the older hub invocation
 `python /config/netmiko/lgs_mcp.py`. That file is not a standalone
 implementation: it imports `netmiko_mcp_linksys`. Prefer the `uvx --from ...
 netmiko-mcp-linksys` entry above. If you must keep the old command, add
-`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1` so the
+`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.2` so the
 package is installed in that environment.
 
 ## Environment variables
@@ -74,7 +74,7 @@ is set to a valid list, disable and PoE-off are refused.
     "command": "uvx",
     "args": [
       "--python", "3.12",
-      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.1",
+      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.2",
       "netmiko-mcp-linksys"
     ],
     "env": {
@@ -113,13 +113,14 @@ Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 | `port_overview()` | Read-only bundle of `show system information`, `show vlan`, `show power inline`, and `show interfaces`, each passed through the same command filter. | n/a |
 | `port_set_admin_state(port, enabled)` | `interface gigabitethernet 0/N` then `no shutdown` / `shutdown`. | no |
 | `poe_set(port, enabled)` | `interface gigabitethernet 0/N` then `power inline enable` / `power inline disable`. PoE ports: `0/1`–`0/24`. | no |
-| `port_set_description(port, text?)` | `description <text>` or `no description` when `text` is omitted. | no |
+| `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back check (found without quotes / found with quotes / not visible). | no |
 | `save_config()` | Privileged exec `save` only. Gate this in the hub with `unlock`. | yes |
 
 There are no VLAN, reboot, or reset tools.
 
 Port format: `0/1` … `0/28` (no leading zeros). PoE: `0/1` … `0/24`.
-Descriptions: 1–32 characters from `[A-Za-z0-9 ._-]`.
+Descriptions: 1–32 characters from `[A-Za-z0-9 ._-]`. Quotes are not allowed
+in the input, so the wrapper's own quoting cannot be broken out of.
 
 ## Security model
 
@@ -167,28 +168,38 @@ therefore:
    `-- More --`, `--More-- (NN%)`, `More: <space>, Quit: q …`,
    `<--- More --->`, `Press any key to continue`) it sends one space, and it
    finishes on the real prompt (`<hostname>#`). Pager text, backspaces, ANSI
-   sequences, the command echo, and the trailing prompt are stripped.
+   sequences, orphaned ESC bytes, other control characters, the command echo,
+   and the trailing prompt are stripped. Blank lines directly after a page
+   break (the pager's erase sequence, which netmiko turns into newlines) are
+   dropped; blank lines elsewhere in the output are kept.
 3. Gives up after `SWITCH_READ_TIMEOUT` seconds without new output. The error
    contains the last visible line, so an unknown pager prompt can be added.
 
 ## Live-test status
 
-Confirmed on LGS328PC, firmware 1.01.02.02 (0.1.0 live test):
+Confirmed on LGS328PC, firmware 1.01.02.02 (0.1.0 and 0.1.1 live tests):
 
 - paramiko 4.0.0 negotiates `ssh-rsa`/SHA-1; strict host-key check works.
 - Login lands directly in privilege 15 (`LGS328PC#`); no enable needed, no
   banner, no second login prompt.
 - `show version` does not exist; use `show system information`.
 - Read-back `show power inline gigabitethernet 0/N` works.
+- Read-back `show interfaces gigabitethernet 0/N` works; output starts with
+  e.g. `Gi0/24 up, line protocol is up (connected)`.
+- The pager loop completes long outputs (`show interfaces status`,
+  `show power inline`, `show interfaces gigabitethernet 0/24`), tested with
+  `SWITCH_PAGING_OFF=0`.
 - Invalid commands return `%` / `Invalid` (the error heuristic).
+- `description <two words>` unquoted is rejected (`% Invalid input detected`
+  at the second word); fixed in 0.1.2 by quoting.
 
-Still to confirm with 0.1.1:
+Still to confirm with 0.1.2:
 
-- Long outputs through the pager loop, and the exact pager prompt text.
+- Quoted `description "<text>"` is accepted and shown without quotes.
+- Page breaks without leftover ESC bytes or blank lines.
 - Whether `set cli pagination off` in config mode is accepted.
-- Read-back `show interfaces gigabitethernet 0/N`.
-- `send_config_set` with `configure terminal` / `end` for the interface
-  tools, and the output of `save`.
+- The other interface tools (`shutdown`, `power inline …`) and the output of
+  `save`.
 - Hub `unlock` behaviour for `save_config`.
 
 ## Development

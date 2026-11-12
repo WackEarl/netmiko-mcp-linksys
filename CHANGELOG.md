@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-11-12
+
+Fixes from the 0.1.1 live retest on the LGS328PC (firmware 1.01.02.02),
+tracked in [#1](https://github.com/WackEarl/netmiko-mcp-linksys/issues/1).
+
+### Fixed
+
+- `port_set_description` now sends the text quoted (`description "Repeater EG"`).
+  Unquoted, the LGS CLI rejected multi-word descriptions with
+  `% Invalid input detected` at the second word. Quoting is always applied;
+  input validation still forbids quotes (#1).
+- Page breaks no longer leave an ESC byte and blank lines in the output (for
+  example between `Gi0/20` and `Gi0/21`). Stray ESC bytes, wider ANSI/VT100
+  sequences (CSI, OSC, charset, two-byte ESC), and other control characters
+  are stripped; blank lines directly after a page break are dropped, other
+  blank lines are kept (#1).
+
+### Added
+
+- `port_set_description` appends an informational read-back check: whether
+  the description shows up in `show interfaces gigabitethernet 0/N` without
+  quotes, with quotes (stored literally), or not at all.
+
+### Changed
+
+- README: read-back `show interfaces gigabitethernet 0/N` and the pager loop
+  are confirmed live; install pins now point to `@v0.1.2`.
+
 ## [0.1.1] - 2026-11-12
 
 Fixes from the first live test on an LGS328PC (firmware 1.01.02.02).

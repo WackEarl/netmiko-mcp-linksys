@@ -43,7 +43,7 @@ def test_poe_sequences() -> None:
 def test_description_sequences() -> None:
     assert build_description_commands("0/2", "nas uplink") == [
         "interface gigabitethernet 0/2",
-        "description nas uplink",
+        'description "nas uplink"',
     ]
     assert build_description_commands("0/2", None) == [
         "interface gigabitethernet 0/2",
