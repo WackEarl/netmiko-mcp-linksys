@@ -56,7 +56,7 @@ PAGER_RE = re.compile(
 # which can orphan an ESC).
 ANSI_RE = re.compile(
     r"\x1b\[[0-?]*[ -/]*[@-~]"
-    r"|\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)?"
+    r"|\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)"
     r"|\x1b[()#%][A-Za-z0-9]"
     r"|\x1b[78=>DEHMc\\]"
 )

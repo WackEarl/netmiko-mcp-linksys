@@ -127,3 +127,27 @@ def test_clean_output_without_page_break_keeps_blank_lines() -> None:
 
     prompt = re.compile(r"^\s*LGS328PC[^\r\n#>]*[#>]\s*$")
     assert clean_output("show x\na\n\nb\nLGS328PC#", "show x", prompt) == "a\n\nb"
+
+
+def test_unterminated_osc_does_not_eat_line():
+    import re as _re
+
+    from netmiko_mcp_linksys.connection import clean_output
+    out = clean_output("\x1b]0 real line\nLGS328PC#", "", _re.compile(r"^LGS328PC#\s*$"))
+    assert "real line" in out
+
+
+def test_terminated_osc_is_stripped():
+    import re as _re
+
+    from netmiko_mcp_linksys.connection import clean_output
+    out = clean_output("\x1b]0;title\x07Gi0/1 up\nLGS328PC#", "", _re.compile(r"^LGS328PC#\s*$"))
+    assert "Gi0/1 up" in out and "title" not in out
+
+
+def test_whitespace_only_description_rejected():
+    import pytest as _pytest
+
+    from netmiko_mcp_linksys.validation import ValidationError, validate_description
+    with _pytest.raises(ValidationError):
+        validate_description("   ")

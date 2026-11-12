@@ -22,6 +22,15 @@ tracked in [#1](https://github.com/WackEarl/netmiko-mcp-linksys/issues/1).
   are stripped; blank lines directly after a page break are dropped, other
   blank lines are kept (#1).
 
+- Descriptions consisting only of spaces are rejected.
+
+### Known limitations
+
+- If netmiko splits an escape sequence across two reads, the orphaned ESC can
+  still take a following character with it (e.g. `ESC D…`, `ESC [G…`). An OSC
+  sequence is only stripped when terminated (BEL or ST), so an orphaned
+  `ESC ]` no longer eats the rest of the line.
+
 ### Added
 
 - `port_set_description` appends an informational read-back check: whether

@@ -71,7 +71,11 @@ def validate_port(port: str, *, poe: bool = False) -> str:
 
 
 def validate_description(text: str) -> str:
-    if not isinstance(text, str) or not DESCRIPTION_RE.fullmatch(text):
+    if (
+        not isinstance(text, str)
+        or not DESCRIPTION_RE.fullmatch(text)
+        or not text.strip()
+    ):
         raise ValidationError(
             "Invalid description. Use 1..32 characters from [A-Za-z0-9 ._-]; "
             "no quotes, '?', '|', or control characters."
