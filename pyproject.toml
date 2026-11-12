@@ -1,0 +1,34 @@
+[project]
+name = "netmiko-mcp-linksys"
+version = "0.1.0"
+description = "stdio MCP wrapper based on netmiko and netmiko-mcp for Linksys LGS-series switches"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "WackEarl" }]
+dependencies = [
+    "netmiko==4.8.0",
+    "paramiko==4.0.0",
+    "netmiko-mcp==0.3.0",
+    "mcp==2.3.0",
+]
+
+[project.scripts]
+netmiko-mcp-linksys = "netmiko_mcp_linksys.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/netmiko_mcp_linksys"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = ["--strict-markers", "--strict-config"]

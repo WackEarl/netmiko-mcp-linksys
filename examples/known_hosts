@@ -1,0 +1,6 @@
+# EXAMPLE ONLY — not a real host key. Do not use this in production.
+# Collect the switch key out-of-band, for example with:
+#   ssh-keyscan -t rsa <switch-ip>
+# Verify the fingerprint before installing the file pointed at by SWITCH_KNOWN_HOSTS.
+# Format: <host> <key-type> <base64-key>
+192.0.2.10 ssh-rsa REPLACE_WITH_YOUR_SWITCH_HOST_KEY

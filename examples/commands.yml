@@ -1,0 +1,75 @@
+# Example show whitelist for the `show` tool.
+# Validation is performed by netmiko-mcp 0.3.0 (default-deny; deny wins).
+# Config actions never go through this file; they use the fixed wrapper tools.
+# Changes take effect only after a server restart (lru_cache).
+allowed_commands:
+  - show system information
+  - show version
+  - show clock
+  - show privilege
+  - show users
+  - show vlan
+  - show vlan *
+  - show mac-address-table
+  - show mac-address-table *
+  - show power inline
+  - show power inline *
+  - show power detail
+  - show lldp
+  - show lldp neighbors
+  - show lldp neighbors *
+  - show lldp local *
+  - show lldp interface *
+  - show logging
+  - show spanning-tree
+  - show spanning-tree *
+  - show etherchannel
+  - show etherchannel *
+  - show ip interface
+  - show ip arp
+  - show ip route
+  - show interface port-security
+  - show interface *
+  - show interfaces
+  - show interfaces *
+  - show flow-control
+  - show eee
+  - show jumbo-frame
+  - show sntp status
+  - show ssh-configurations
+  - show telnet server
+  - show http server status
+  - show lbd state
+  - show lbd port state
+denied_commands:
+  # Active tests / secrets / config dumps
+  - show interface cable-diag*
+  - show snmp*
+  - show radius*
+  - show running-config*
+  - show current*
+  - show startup-config*
+  # Changing commands (defense in depth, also covers abbreviations)
+  - configure*
+  - save*
+  - write*
+  - reboot*
+  - reload*
+  - restore-defaults*
+  - clear*
+  - copy*
+  - erase*
+  - delete*
+  - set*
+  - no *
+  - username*
+  - ping*
+  - traceroute*
+  - lock*
+  - debug*
+  - interface*
+  - shutdown*
+  - power*
+  - description*
+  - end*
+  - exit*
