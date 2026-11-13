@@ -236,6 +236,11 @@ show snmp group access
 show snmp user
 ```
 
+View names are compared exactly (case-sensitive). A view name that
+differs from an existing view only in letter case (for example `wv` and
+`WV`) is refused, because it is not confirmed whether the switch treats
+view names case-sensitively.
+
 This is **not** Cisco IOS (`snmp-server community X view V rw`). Generic
 Aricent ISS documentation (Super Micro SNMP Configuration Guide, Cisco
 Skylight/Flex SNMP commands) often uses `snmp community index <Index>

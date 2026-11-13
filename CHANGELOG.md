@@ -49,6 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single session with the "Configuration was sent, verification failed"
   wrapper for post-send read-back errors.
 
+### Security
+
+- SNMP view names are compared exactly (case-sensitive) in all view
+  checks (`view_is_restricted`, `view_is_write_safe`, the read-back
+  checks, and the PoE/write-view prechecks). A view name that differs
+  from an existing view only in letter case is refused (fail-closed),
+  because it is not live-confirmed whether ISS treats view names
+  case-sensitively. Before, `snmp_view_create("wv")` plus
+  `snmp_write_view_create("WV")` let a community with write view `wv`
+  pass the write-view check through the exclusions of `WV`, so the
+  ifAdminStatus of the protected ports could have been writable (found
+  by Cody). `snmp_view_create` now reads `show snmp viewtree` before
+  sending and refuses if it cannot be parsed.
+
 - SNMP community rejection paths return only a generic message (no device
   text). ANSI and prompt redraws are stripped only inside
   `snmp community name` … `security` command spans; other output stays
