@@ -129,10 +129,7 @@ def _normalize_echo(text: str) -> str:
     return " ".join(text.replace('"', "").split())
 
 
-def config_output_is_error(
-    output: str,
-    commands: Sequence[str] | None = None,
-) -> bool:
+def config_output_is_error(output: str, *, commands: Sequence[str]) -> bool:
     """Classify switch config/save output as a device rejection.
 
     Each line is first run through strip_controls (same helper as the
@@ -157,7 +154,7 @@ def config_output_is_error(
         return False
     sent = {
         _normalize_echo(command)
-        for command in (commands or ())
+        for command in commands
         if _normalize_echo(command)
     }
     for line in output.splitlines():
