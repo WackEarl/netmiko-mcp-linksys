@@ -566,9 +566,10 @@ def oid_arcs(oid: str) -> tuple[int, ...] | None:
     """Parse an OID as printed by the switch into its arcs, or None.
 
     The one central OID normalization (Cody, review of bc96149): surrounding
-    whitespace, one leading dot, a leading ``iso`` arc (= 1) and trailing
-    dots are accepted, so ``.1.3.6.1``, ``iso.3.6.1``, ``.iso.3.6.1.`` and
-    ``1.3.6.1`` are the same OID. Anything else (empty arcs, signs, leading
+    whitespace, one leading dot, a leading ``iso`` arc (= 1, only when
+    followed by 3) and trailing dots are accepted, so ``.1.3.6.1``,
+    ``iso.3.6.1``, ``.iso.3.6.1.`` and ``1.3.6.1`` are the same OID;
+    ``iso.1.3.6.1`` or a bare ``iso`` is refused. Anything else (empty arcs, signs, leading
     zeros, other names, masks or extra tokens) is None, and callers must
     treat None as "refuse" (fail-closed).
     """
@@ -579,6 +580,10 @@ def oid_arcs(oid: str) -> tuple[int, ...] | None:
         return None
     parts = text.split(".")
     if parts[0].lower() == "iso":
+        # iso.3.6.1... = 1.3.6.1...; "iso.1.3...", a bare "iso" or any other
+        # continuation is ambiguous and refused instead of reinterpreted.
+        if len(parts) < 2 or parts[1] != "3":
+            return None
         parts[0] = "1"
     if not all(_OID_ARC_RE.fullmatch(part) for part in parts):
         return None

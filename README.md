@@ -320,18 +320,31 @@ with `%`, and netmiko stops at the first one):
    refused, or an exclusion is silently missing, the exclusions sent by
    this call are removed again and the included column is **never sent**.
 2. Only then the included column is sent, and the whole write view is
-   checked again. On any error the column and this call's exclusions are
-   removed (`no snmp view <view> <oid>`, column first).
+   checked again. On any error the change is rolled back in two steps.
+
+The rollback follows one rule: an exclusion is never removed while an
+included subtree it protects is still in the view.
+
+1. If this call added the included column, only that column is removed
+   (`no snmp view <view> <oid>`) and `show snmp viewtree` is read back.
+   If it is still there, or the read-back is unclear, the rollback stops
+   at once, keeps every exclusion and says `ROLLBACK NOT VERIFIED`.
+   Communities already bound to that view may be affected; check
+   `show snmp group access`.
+2. Only then this call's exclusions are removed, except any that still
+   protect an included column of the view (those are kept and named).
 
 After a rollback `show snmp viewtree` must match the state before the
 call exactly; otherwise the result says `ROLLBACK NOT VERIFIED` and the
 view must not be bound to a community. Exclusions that existed before the
-call are never removed.
+call are never removed. The write-view rollback is the only place that
+sends `no snmp view`; no tool removes view entries otherwise.
 
 OIDs from `show snmp viewtree` go through one normalization
-(`oid_arcs`): whitespace, one leading dot, a leading `iso` (= `1`) and
-trailing dots are accepted, so `.1.3.6.1…`, `iso.3.6.1…` and `1.3.6.1…`
-are the same OID. Prefixes are compared by whole arcs, so
+(`oid_arcs`): whitespace, one leading dot, a leading `iso` (= `1`, only
+when followed by `3`) and trailing dots are accepted, so `.1.3.6.1…`,
+`iso.3.6.1…` and `1.3.6.1…` are the same OID; `iso.1.3.6.1…`, a bare
+`iso` and other variants are refused instead of reinterpreted. Prefixes are compared by whole arcs, so
 `1.3.6.1.2.1.105` is not below `1.3.6.1.2.1.10`. Any other format, and
 any entry with a mask that is not empty or all-ones (a possible
 wildcard), makes the check refuse (fail-closed), in the read-view
