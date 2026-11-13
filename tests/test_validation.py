@@ -193,6 +193,19 @@ def test_config_output_ignores_error_words_in_echoed_description(description: st
     )
 
 
+@pytest.mark.parametrize("description", ["Error LED", "Invalid Port"])
+def test_config_output_ignores_unquoted_echoed_description(description: str) -> None:
+    commands = _description_commands(description)
+    assert config_output_is_error(f"description {description}", commands) is False
+    assert (
+        config_output_is_error(
+            f"LGS328PC(config-if)# description {description}",
+            commands,
+        )
+        is False
+    )
+
+
 def test_config_output_detects_iss_percent_error() -> None:
     raw = (
         "interface gigabitethernet 0/7\r\n"

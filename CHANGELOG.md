@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prompt the remainder is not empty, is not one of the commands just
   sent, and contains the word `Error` or `Invalid` (case-insensitive).
   Echoed descriptions such as `description "Error LED"` are therefore
-  not reported as rejected; a separate line like
+  not reported as rejected, including an unquoted echo
+  (`description Error LED`); a separate line like
   `Error: port is protected` is
   ([#3](https://github.com/WackEarl/netmiko-mcp-linksys/issues/3)).
 

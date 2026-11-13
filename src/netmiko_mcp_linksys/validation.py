@@ -124,6 +124,11 @@ def _line_without_prompt(line: str) -> str:
     return line[match.end() :].strip()
 
 
+def _normalize_echo(text: str) -> str:
+    """Drop double quotes, collapse whitespace, and strip for echo compares."""
+    return " ".join(text.replace('"', "").split())
+
+
 def config_output_is_error(
     output: str,
     commands: Sequence[str] | None = None,
@@ -139,15 +144,22 @@ def config_output_is_error(
       contain '%' (descriptions allow only [A-Za-z0-9 ._-]).
     * A leading prompt (hostname, optional ``(config…)``, then ``#`` or
       ``>``) is removed. An empty remainder (prompt-only) is skipped.
-    * If the remainder equals one of the commands just sent, the line is
-      an echo and is skipped.
+    * If the remainder matches one of the commands just sent — after
+      dropping double quotes, collapsing whitespace, and stripping —
+      the line is an echo and is skipped. An unquoted echo such as
+      ``description Error LED`` therefore matches the sent
+      ``description "Error LED"``.
     * Otherwise the words ``Error`` and ``Invalid`` (case-insensitive)
       are treated as a failure, so a line such as
       ``Error: port is protected`` is caught.
     """
     if not output:
         return False
-    sent = {command.strip() for command in (commands or ()) if command.strip()}
+    sent = {
+        _normalize_echo(command)
+        for command in (commands or ())
+        if _normalize_echo(command)
+    }
     for line in output.splitlines():
         stripped = strip_controls(line).strip()
         if not stripped:
@@ -155,7 +167,7 @@ def config_output_is_error(
         if "%" in stripped:
             return True
         remainder = _line_without_prompt(stripped)
-        if not remainder or remainder in sent:
+        if not remainder or _normalize_echo(remainder) in sent:
             continue
         if _ERROR_WORD_RE.search(remainder):
             return True
