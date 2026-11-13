@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-11-13
 
 ### Added
 
@@ -15,8 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after the new community is verified with a restricted view, and remove
   only `noAuthUser`. POWER-ETHERNET-MIB (`1.3.6.1.2.1.105`) is an
   allow-listed read-view subtree so HA can read PoE. Command templates live in `snmp_cli.py`
-  and follow the Linksys LGSXXX CLI manual; they are **not live-confirmed**
+  and follow the Linksys LGSXXX CLI manual
   ([#7](https://github.com/WackEarl/netmiko-mcp-linksys/issues/7)).
+  The write-view create syntax and the viewtree read-back were
+  live-confirmed on 2026-11-13; community create/remove syntax and the
+  SNMP read/write path through an external client are not.
   SNMP write tools require `SWITCH_SNMP_WRITE_ENABLED=1` (off by default),
   disable the session log for the call, and redact community echoes
   (including wrapped lines and `re.escape`/`repr` variants). The community
@@ -40,7 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Included`) and starts a new entry at every `View Name` line, so blank
   line separated blocks work too. Masks are read per RFC 3415: a full
   mask such as `1`, `1.1.1` or `ff:e0` (11-arc column) is exact, a mask
-  with a 0 inside the OID length is a wildcard and refused.
+  with a 0 inside the OID length is a wildcard and refused. The 0.2.0
+  live check printed a column mask as `1.1.1…` (one `1` per arc) with
+  Storage Type Non-volatile.
 
 ### Changed
 
@@ -59,6 +64,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   widen the column-only write view), and now runs in a
   single session with the "Configuration was sent, verification failed"
   wrapper for post-send read-back errors.
+- README: install pins now point to `@v0.2.0`.
+
+### Live test
+
+Redy's 0.2.0 live check on an LGS328PC (firmware 1.01.02.02, commit
+177dc84, 2026-11-13):
+
+- Device error lines start with `%` (example: `% Invalid input detected
+  at '^' marker`).
+- A column OID without a mask is accepted (`snmp view <view> <column>
+  included`).
+- `show snmp viewtree` (and its alias `show snmp view`) prints a column
+  entry as `Subtree OID  : 1.3.6.1.2.1.105.1.1.1.3` / `Subtree Mask :
+  1.1.1.1.1.1.1.1.1.1.1` (one `1` per arc), `View Type : Included`,
+  `Storage Type : Non-volatile` immediately, without `save_config`.
+- `port_set_admin_state` and `poe_set` (CLI) worked on a free port
+  (0/18) and were reversed.
+
+Not live-verified in that check:
+
+- The SNMP read/write path through an external client (GET/WALK/SET).
+- Community create/remove syntax (the switch lists communities under a
+  Community Index, so the ISS form with `index` may be required; the
+  Linksys form without `index` remains unconfirmed).
+- `no snmp view <view> <oid>` to remove a single entry (the rollback
+  path was not triggered).
 
 ### Security
 
