@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.3] - 2026-11-13
+
+Fixes from Cody's architecture review and the remaining nits from the
+0.1.2 live retest, tracked in [#2](https://github.com/WackEarl/netmiko-mcp-linksys/issues/2)
+and [#3](https://github.com/WackEarl/netmiko-mcp-linksys/issues/3).
 
 ### Fixed
 
@@ -43,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   v0.1.2 live retest are removed ([#2](https://github.com/WackEarl/netmiko-mcp-linksys/issues/2)).
 - `examples/commands.yml` lists `show interfaces description` (already
   covered by `show interfaces *`).
+
+### Changed
+
+- README: install pins now point to `@v0.1.3`.
 
 ## [0.1.2] - 2026-11-12
 

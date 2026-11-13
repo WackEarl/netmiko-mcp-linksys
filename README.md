@@ -10,7 +10,7 @@ same allow/deny list format (`commands.yml`). Configuration tools send only
 fixed command sequences built by this wrapper; the model never supplies
 free-form config.
 
-**This is 0.1.2.** It includes the fixes from the live tests on an
+**This is 0.1.3.** It includes the fixes from the live tests on an
 LGS328PC with firmware 1.01.02.02 (SSH with `ssh-rsa` via paramiko 4.0.0;
 login lands directly in privilege 15 with prompt `LGS328PC#`; no banner or
 second login prompt). See [Live-test status](#live-test-status).
@@ -21,7 +21,7 @@ The intended way to run this server is the packaged entrypoint, pinned to a
 tag:
 
 ```bash
-uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.2 netmiko-mcp-linksys
+uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.3 netmiko-mcp-linksys
 ```
 
 From a local checkout:
@@ -40,7 +40,7 @@ A compatibility shim, `lgs_mcp.py`, exists only for the older hub invocation
 `python /config/netmiko/lgs_mcp.py`. That file is not a standalone
 implementation: it imports `netmiko_mcp_linksys`. Prefer the `uvx --from ...
 netmiko-mcp-linksys` entry above. If you must keep the old command, add
-`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.2` so the
+`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.3` so the
 package is installed in that environment.
 
 ## Environment variables
@@ -74,7 +74,7 @@ is set to a valid list, disable and PoE-off are refused.
     "command": "uvx",
     "args": [
       "--python", "3.12",
-      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.2",
+      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.3",
       "netmiko-mcp-linksys"
     ],
     "env": {
