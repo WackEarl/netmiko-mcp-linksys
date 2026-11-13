@@ -2727,3 +2727,196 @@ def test_run_show_sequence_redacts_like_run_show(
         assert output is not None
         assert not _secret_in(output, SECRET)
         assert "[REDACTED]" in output
+
+
+# ---------------------------------------------------------------------------
+# Review findings on PR #9: timeout leak + abbreviated SNMP shows (Refs #5)
+# ---------------------------------------------------------------------------
+
+
+# Dummy name used only in fixtures; never a real community.
+_FOREIGN_COMMUNITY = "OldSecretComm77"
+
+_FOREIGN_COMMUNITY_SHOW = (
+    COMMUNITY_SHOW
+    + "------------------------------\n"
+    + "Community Index: old\n"
+    + f"Community Name: {_FOREIGN_COMMUNITY}\n"
+    + "Security Name: old_sec\n"
+)
+
+
+class _IdleTimeoutChannel:
+    """Releases one scripted reply, then goes silent so send_paged times out."""
+
+    RETURN = "\n"
+    base_prompt = "LGS328PC"
+
+    def __init__(self, replies: list[list[str]]) -> None:
+        self._replies = [list(item) for item in replies]
+        self._queue: list[str] = []
+
+    def clear_buffer(self) -> None:
+        return None
+
+    def write_channel(self, _data: str) -> None:
+        if self._replies:
+            self._queue.extend(self._replies.pop(0))
+
+    def read_channel(self) -> str:
+        return self._queue.pop(0) if self._queue else ""
+
+    def disconnect(self) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "show snmp community",
+        "SHOW SNMP COMMUNITY",
+        "  show   snmp   community  ",
+        "sh snmp comm",
+        "sh snmp community",
+        "show snmp comm",
+        "sho snmp commun",
+        "show snmp co",
+    ],
+)
+def test_redact_show_output_masks_abbreviated_community_listings(
+    command: str, community_env: str
+) -> None:
+    out = redact_show_output(command, _FOREIGN_COMMUNITY_SHOW)
+    assert not _secret_in(out, SECRET)
+    assert _FOREIGN_COMMUNITY not in out
+    assert "Community Name: public" not in out
+    assert "[REDACTED]" in out
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["show running-config", "show snmp group", "show system information"],
+)
+def test_redact_show_output_does_not_listing_redact_other_shows(
+    command: str, community_env: str
+) -> None:
+    out = redact_show_output(command, _FOREIGN_COMMUNITY_SHOW)
+    assert not _secret_in(out, SECRET)
+    assert _FOREIGN_COMMUNITY in out
+    assert "Community Name: public" in out
+
+
+@pytest.mark.parametrize(
+    ("command", "sensitive"),
+    [
+        ("show snmp community", True),
+        ("SHOW SNMP COMMUNITY", True),
+        ("  show   snmp   community  ", True),
+        ("sh snmp comm", True),
+        ("sh snmp community", True),
+        ("show snmp comm", True),
+        ("sho snmp co", True),
+        ("show snmp viewtree", True),
+        ("sh snmp viewt", True),
+        ("show snmp view", True),
+        ("sh snmp user", True),
+        ("show snmp us", True),
+        ("show snmp group", False),
+        ("show snmp group access", False),
+        ("show system information", False),
+        ("show running-config", False),
+        ("s snmp community", False),
+        ("show snmp c", False),
+        ("show snmp", False),
+        ("show interfaces", False),
+    ],
+)
+def test_is_snmp_sensitive_show_matches_abbreviations(
+    command: str, sensitive: bool
+) -> None:
+    from netmiko_mcp_linksys.connection import _is_snmp_sensitive_show
+
+    assert _is_snmp_sensitive_show(command) is sensitive
+
+
+def test_run_show_sequence_disables_session_log_for_abbreviations(
+    community_env: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from netmiko_mcp_linksys import connection
+
+    monkeypatch.setenv("SWITCH_SESSION_LOG", str(tmp_path / "session.log"))
+    captured: list[dict[str, Any]] = []
+
+    def fake_handler(**params: Any) -> _FakeConn:
+        captured.append(dict(params))
+        return _FakeConn("ok")
+
+    def fake_paged(_conn: Any, _command: str, *_a: Any, **_k: Any) -> str:
+        return _FOREIGN_COMMUNITY_SHOW
+
+    with (
+        patch.object(connection, "ConnectHandler", fake_handler),
+        patch.object(connection, "disable_paging_best_effort", lambda _c: None),
+        patch.object(connection, "send_paged", fake_paged),
+    ):
+        for cmds in (
+            ["sh snmp comm"],
+            ["sh snmp community"],
+            ["show snmp comm"],
+            ["show system information", "sh snmp comm"],
+        ):
+            captured.clear()
+            results = connection.run_show_sequence(list(cmds))
+            assert "session_log" not in captured[-1], cmds
+            for command, output, error in results:
+                assert error is None
+                assert output is not None
+                if connection._is_snmp_sensitive_show(command):
+                    assert not _secret_in(output, SECRET)
+                    assert _FOREIGN_COMMUNITY not in output
+                    assert "[REDACTED]" in output
+        captured.clear()
+        unsensitive = connection.run_show_sequence(["show system information"])
+        assert "session_log" in captured[-1]
+        assert unsensitive[0][2] is None
+        assert _FOREIGN_COMMUNITY in (unsensitive[0][1] or "")
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["show snmp community", "sh snmp comm", "show snmp viewtree", "show snmp user"],
+)
+def test_send_paged_timeout_omits_last_line_for_sensitive_snmp_show(
+    command: str, community_env: str
+) -> None:
+    from netmiko_mcp_linksys.connection import send_paged
+
+    chan = _IdleTimeoutChannel(
+        [[f"{command}\r\n", f"Community Name: {_FOREIGN_COMMUNITY}"]]
+    )
+    with pytest.raises(ConnectionError) as excinfo:
+        send_paged(chan, command, timeout=0.05, poll_interval=0.01)
+    msg = str(excinfo.value)
+    assert f"No prompt after {command!r}" in msg
+    assert "last line:" not in msg
+    assert _FOREIGN_COMMUNITY not in msg
+    assert not _secret_in(msg, SECRET)
+    assert "pages: 0" in msg
+
+
+def test_send_paged_timeout_keeps_redacted_last_line_for_other_shows(
+    community_env: str,
+) -> None:
+    from netmiko_mcp_linksys.connection import send_paged
+
+    chan = _IdleTimeoutChannel(
+        [["show interfaces\r\n", f"Description: {SECRET} uplink"]]
+    )
+    with pytest.raises(ConnectionError) as excinfo:
+        send_paged(chan, "show interfaces", timeout=0.05, poll_interval=0.01)
+    msg = str(excinfo.value)
+    assert "No prompt after 'show interfaces'" in msg
+    assert "last line:" in msg
+    assert "uplink" in msg
+    assert not _secret_in(msg, SECRET)
+    assert "[REDACTED]" in msg

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Idle-timeout errors from `send_paged` now run the last output line through
+  `redact_show_output`, and omit that line entirely for sensitive SNMP show
+  commands (`show snmp community|viewtree|user` and abbreviated forms such
+  as `sh snmp comm`) so a foreign community cannot leak to the MCP client
+  ([#5](https://github.com/WackEarl/netmiko-mcp-linksys/issues/5)).
+- `_is_snmp_sensitive_show` and `redact_show_output` recognize those
+  abbreviated forms with the same whitespace normalization as the show-tool
+  command filter and prefix matching on `show` and the kind word, so the
+  session log stays off and community listings stay masked
+  ([#5](https://github.com/WackEarl/netmiko-mcp-linksys/issues/5)).
+
 ### Changed
 
 - `port_overview` runs its four allow-listed show commands in a single SSH
