@@ -24,9 +24,9 @@ import re
 from dataclasses import dataclass
 
 from netmiko_mcp_linksys.validation import (
-    SNMP_PROTECTED_IFINDEXES_ENV,
     ValidationError,
     parse_protected_ifindexes,
+    parse_protected_poe_indexes,
     redact_secrets,
     valid_community_for_redaction,
 )
@@ -75,8 +75,10 @@ from netmiko_mcp_linksys.validation import (
 # 1.3.6.1.2.1.105 is implemented on the LGS328PC.
 #
 # UNCONFIRMED: the LGS328PC port -> ifIndex mapping (hence the explicit
-# SWITCH_SNMP_PROTECTED_IFINDEXES), whether an instance OID such as
-# 1.3.6.1.2.1.2.2.1.7.<ifIndex> is accepted as an excluded subtree
+# SWITCH_SNMP_PROTECTED_IFINDEXES), the port -> pethPsePortTable
+# <group>.<port> mapping (hence SWITCH_SNMP_PROTECTED_POE_INDEXES),
+# whether an instance OID such as 1.3.6.1.2.1.2.2.1.7.<ifIndex> or
+# 1.3.6.1.2.1.105.1.1.1.3.<group>.<port> is accepted as an excluded subtree
 # without a mask, and how show snmp viewtree prints the view type and
 # the mask (the parser accepts only empty or all-ones masks).
 
@@ -101,9 +103,9 @@ ALLOWED_SUBTREES: dict[str, str] = {
     "1.3.6.1.2.1.2": "interfaces (IF-MIB): ifAdminStatus, ifOperStatus, counters",
     "1.3.6.1.2.1.31": "ifMIB: ifXTable, ifAlias, ifHC* bandwidth counters",
     "1.3.6.1.2.1.105": (
-        "POWER-ETHERNET-MIB: PoE admin/detection/budget (optional; "
-        "needed for Home Assistant PoE read or control; RW then also "
-        "allows PoE off via SNMP)"
+        "POWER-ETHERNET-MIB: PoE admin/detection/budget (read view; "
+        "PoE switching goes through the pethPsePortAdminEnable column "
+        "of a write view)"
     ),
 }
 
@@ -119,13 +121,30 @@ OID_ALIASES: dict[str, str] = {
 
 POE_SUBTREE = "1.3.6.1.2.1.105"
 
-# Subtrees a *write* view may include. POWER-ETHERNET-MIB is read-only by
-# design: port 0/10 powers the Unraid server through a PoE splitter, so a
-# write view must never allow pethPsePortAdminEnable.
-WRITE_ALLOWED_SUBTREES = frozenset({"1.3.6.1.2.1.2", "1.3.6.1.2.1.31"})
-
 # IF-MIB ifTable ifAdminStatus column; .<ifIndex> selects one interface.
 IF_ADMIN_STATUS_OID = "1.3.6.1.2.1.2.2.1.7"
+# IF-MIB ifXTable ifAlias column (port description).
+IF_ALIAS_OID = "1.3.6.1.2.1.31.1.1.1.18"
+# POWER-ETHERNET-MIB pethPsePortTable pethPsePortAdminEnable column;
+# .<pethPsePortGroupIndex>.<pethPsePortIndex> selects one PoE port.
+POE_ADMIN_ENABLE_OID = "1.3.6.1.2.1.105.1.1.1.3"
+
+# The only columns a *write* view may include (Task 48, Redy's plan
+# approved by Roland): port admin state, port description, PoE on/off.
+# Whole MIB subtrees stay read-view only. Every write view also excludes
+# ifAdminStatus.<ifIndex> of the protected ports, and a write view with
+# pethPsePortAdminEnable also excludes pethPsePortAdminEnable.<group>.<port>
+# of the protected PoE ports (0/10 powers the Unraid server through a PoE
+# splitter; 0/24 is the uplink).
+WRITE_ALLOWED_SUBTREES: dict[str, str] = {
+    IF_ADMIN_STATUS_OID: "ifAdminStatus",
+    IF_ALIAS_OID: "ifAlias",
+    POE_ADMIN_ENABLE_OID: "pethPsePortAdminEnable",
+}
+
+WRITE_OID_ALIASES: dict[str, str] = {
+    name.lower(): oid for oid, name in WRITE_ALLOWED_SUBTREES.items()
+}
 
 # Views that cover the whole tree (or equally broad roots) are never
 # "expected" access for the new community.
@@ -196,23 +215,42 @@ def build_view_create_commands(view_name: str, oid: str) -> list[str]:
     return [f"snmp view {view_name} {oid} included"]
 
 
+def _oid_key(oid: str) -> list[int]:
+    return [int(part) for part in oid.split(".")]
+
+
 def protected_admin_status_oids(ifindexes: dict[str, str]) -> list[str]:
     """ifAdminStatus.<ifIndex> OIDs to exclude from every write view."""
     return sorted(
         (f"{IF_ADMIN_STATUS_OID}.{ifindex}" for ifindex in ifindexes.values()),
-        key=lambda oid: [int(part) for part in oid.split(".")],
+        key=_oid_key,
+    )
+
+
+def protected_poe_admin_oids(poe_indexes: dict[str, str]) -> list[str]:
+    """pethPsePortAdminEnable.<group>.<port> OIDs to exclude from PoE write views."""
+    return sorted(
+        (f"{POE_ADMIN_ENABLE_OID}.{index}" for index in poe_indexes.values()),
+        key=_oid_key,
+    )
+
+
+def _write_allowed_text() -> str:
+    return ", ".join(
+        f"{name} ({oid})" for oid, name in WRITE_ALLOWED_SUBTREES.items()
     )
 
 
 def normalize_write_subtree(subtree: str) -> str:
-    """Return an OID a write view may include, or raise ValidationError."""
-    oid = normalize_subtree(subtree)
+    """Return a column OID a write view may include, or raise ValidationError."""
+    key = subtree.strip() if isinstance(subtree, str) else ""
+    oid = WRITE_OID_ALIASES.get(key.lower(), key)
     if oid not in WRITE_ALLOWED_SUBTREES:
         raise ValidationError(
-            f"subtree {oid} is not allowed in a write view. Write views may "
-            "include only " + ", ".join(sorted(WRITE_ALLOWED_SUBTREES)) + "; "
-            "POWER-ETHERNET-MIB stays read-only (0/10 powers the Unraid "
-            "server via a PoE splitter). Use snmp_view_create for the read view."
+            f"subtree {key or subtree!r} is not allowed in a write view. Write "
+            "views may include only " + _write_allowed_text() + ". Whole MIB "
+            "subtrees (interfaces, ifmib, power-ethernet) belong in the read "
+            "view (snmp_view_create)."
         )
     return oid
 
@@ -222,13 +260,18 @@ def build_write_view_commands(
 ) -> list[str]:
     """Linksys CLI: snmp view <ViewName> <OIDTree> {included | excluded}.
 
-    Exclusions are sent first so the view never includes ifTable without
-    the protected-port ifAdminStatus exclusions, even for a moment.
+    Exclusions are sent first so the view never includes a writable
+    column without the protected-port exclusions, even for a moment.
     """
     if not excluded_oids:
         raise ValidationError(
             "No ifAdminStatus exclusions configured. Refusing to build a "
             "write view (fail-closed)."
+        )
+    if oid == POE_ADMIN_ENABLE_OID and not _poe_exclusions(excluded_oids):
+        raise ValidationError(
+            "No pethPsePortAdminEnable exclusions configured. Refusing to "
+            "add PoE to a write view (fail-closed)."
         )
     return [f"snmp view {view_name} {item} excluded" for item in excluded_oids] + [
         f"snmp view {view_name} {oid} included"
@@ -257,8 +300,9 @@ def build_community_create_commands(
         if write_view.lower() == view_name.lower():
             raise ValidationError(
                 "write_view must differ from the read view (view_name). "
-                "The read view may include POWER-ETHERNET-MIB; the write "
-                "view must not."
+                "The read view holds whole MIB subtrees; the write view "
+                "only the writable columns with the protected-port "
+                "exclusions."
             )
         write = write_view
     else:
@@ -595,9 +639,11 @@ def view_is_write_safe(
     """Strict check of a write view (fail-closed).
 
     Every entry of the view must have an explicit included/excluded type
-    and an exact mask; included subtrees must be in WRITE_ALLOWED_SUBTREES
-    (never POWER-ETHERNET-MIB); every ifAdminStatus exclusion in
-    ``excluded_oids`` must be present as an excluded entry.
+    and an exact mask; included subtrees must be columns in
+    WRITE_ALLOWED_SUBTREES (never a whole MIB subtree); every exclusion in
+    ``excluded_oids`` must be present as an excluded entry. A view that
+    includes pethPsePortAdminEnable must also be checked against PoE
+    exclusions (see write_view_exclusions); without any, it is refused.
     """
     if not excluded_oids:
         return False, (
@@ -632,19 +678,32 @@ def view_is_write_safe(
     for oid in included:
         if oid == POE_SUBTREE:
             return False, (
-                f"write view {view_name!r} includes POWER-ETHERNET-MIB {oid} "
-                "(PoE must stay read-only)"
+                f"write view {view_name!r} includes the whole "
+                f"POWER-ETHERNET-MIB {oid} (only the pethPsePortAdminEnable "
+                f"column {POE_ADMIN_ENABLE_OID} is allowed)"
             )
         if oid not in WRITE_ALLOWED_SUBTREES:
             return False, (
                 f"write view {view_name!r} includes subtree {oid}, which is "
                 "not allowed in a write view"
             )
+    if POE_ADMIN_ENABLE_OID in included and not _poe_exclusions(excluded_oids):
+        return False, (
+            f"write view {view_name!r} includes pethPsePortAdminEnable but no "
+            "PoE exclusions are configured (SWITCH_SNMP_PROTECTED_POE_INDEXES)"
+        )
     missing = [oid for oid in excluded_oids if oid not in excluded]
-    if missing:
+    missing_admin = [oid for oid in missing if not _is_poe_exclusion(oid)]
+    missing_poe = [oid for oid in missing if _is_poe_exclusion(oid)]
+    if missing_admin:
         return False, (
             f"write view {view_name!r} is missing the ifAdminStatus "
-            "exclusion(s) " + ", ".join(missing)
+            "exclusion(s) " + ", ".join(missing_admin)
+        )
+    if missing_poe:
+        return False, (
+            f"write view {view_name!r} is missing the pethPsePortAdminEnable "
+            "exclusion(s) " + ", ".join(missing_poe)
         )
     return True, (
         f"write view {view_name} includes only "
@@ -654,9 +713,41 @@ def view_is_write_safe(
     )
 
 
+def _is_poe_exclusion(oid: str) -> bool:
+    return oid.startswith(POE_ADMIN_ENABLE_OID + ".")
+
+
+def _poe_exclusions(oids: list[str]) -> list[str]:
+    return [oid for oid in oids if _is_poe_exclusion(oid)]
+
+
 def required_write_exclusions() -> list[str]:
     """ifAdminStatus exclusions from SWITCH_SNMP_PROTECTED_IFINDEXES (or raise)."""
     return protected_admin_status_oids(parse_protected_ifindexes())
+
+
+def required_poe_exclusions() -> list[str]:
+    """pethPsePortAdminEnable exclusions from SWITCH_SNMP_PROTECTED_POE_INDEXES (or raise)."""
+    return protected_poe_admin_oids(parse_protected_poe_indexes())
+
+
+def write_view_exclusions(
+    entries: list[ViewSubtree], view_name: str, *, adding: str | None = None
+) -> list[str]:
+    """Exclusions a write view must carry, or raise ValidationError (fail-closed).
+
+    ifAdminStatus of the protected ports is always excluded. If the view
+    includes (or ``adding`` adds) pethPsePortAdminEnable, the protected PoE
+    ports are excluded as well, which requires a valid
+    SWITCH_SNMP_PROTECTED_POE_INDEXES.
+    """
+    included = {compact_oid(oid) for oid in view_included_oids(entries, view_name)}
+    if adding is not None:
+        included.add(adding)
+    exclusions = required_write_exclusions()
+    if POE_ADMIN_ENABLE_OID in included:
+        exclusions += required_poe_exclusions()
+    return exclusions
 
 
 def _model_is_v2c(model: str) -> bool:
@@ -694,8 +785,9 @@ def assert_configured_community_ready(
     """Verify the configured community is present and view-restricted.
 
     A write view (anything other than ``none``) must differ from the read
-    view and pass view_is_write_safe with the ifAdminStatus exclusions
-    from SWITCH_SNMP_PROTECTED_IFINDEXES. If expected views are given
+    view and pass view_is_write_safe with the exclusions from
+    write_view_exclusions (ifAdminStatus always, pethPsePortAdminEnable
+    when the write view includes PoE). If expected views are given
     (after a create), the access entries must name exactly those views;
     ``expected_write_view=None`` then means the write view must be none.
 
@@ -795,11 +887,11 @@ def assert_configured_community_ready(
                     "remove another community."
                 )
             try:
-                exclusions = required_write_exclusions()
+                exclusions = write_view_exclusions(views, write)
             except ValidationError as exc:
                 raise ValidationError(
-                    f"Configured community has write access, but "
-                    f"{SNMP_PROTECTED_IFINDEXES_ENV} is not usable: {exc}"
+                    "Configured community has write access, but the "
+                    f"protected-port exclusions are not usable: {exc}"
                 ) from None
             ok, note = view_is_write_safe(views, write, exclusions)
             if not ok:
