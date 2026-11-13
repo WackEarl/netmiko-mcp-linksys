@@ -204,6 +204,14 @@ therefore:
    lines elsewhere in the output are kept.
 3. Gives up after `SWITCH_READ_TIMEOUT` seconds without new output. The error
    contains the last visible line, so an unknown pager prompt can be added.
+4. For `save` only: if the last visible line ends in a Y/N confirmation
+   (`(y/n)`, `[Y/N]`, `(yes/no)`, optionally followed by `:` or `?`), it
+   answers `y` once. A second confirmation is not answered and fails. Any
+   other prompt (for example `Are you sure?` or `[confirm]`) is not
+   answered and runs into the timeout; `save_config` then reports that
+   whether startup-config was written is unknown. `show` and read-backs
+   never answer a confirmation. The real LGS328PC save prompt is **not
+   live-confirmed** ([#4](https://github.com/WackEarl/netmiko-mcp-linksys/issues/4)).
 
 ## SNMP tools
 
@@ -515,7 +523,8 @@ Still to confirm with 0.1.2:
 - Page breaks without leftover ESC bytes or blank lines.
 - Whether `set cli pagination off` in config mode is accepted.
 - The other interface tools (`shutdown`, `power inline …`) and the output of
-  `save`.
+  `save`, including whether it asks for a confirmation and its exact text
+  ([#4](https://github.com/WackEarl/netmiko-mcp-linksys/issues/4)).
 - Hub `unlock` behaviour for `save_config`.
 
 ## Development

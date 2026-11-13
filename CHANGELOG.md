@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command filter and prefix matching on `show` and the kind word, so the
   session log stays off and community listings stay masked
   ([#5](https://github.com/WackEarl/netmiko-mcp-linksys/issues/5)).
+- `save_config` no longer waits silently on a Y/N confirmation. If the
+  last visible line after `save` ends in `(y/n)`, `[Y/N]`, or `(yes/no)`
+  (optionally followed by `:` or `?`), it answers `y` once. A second
+  confirmation is not answered and fails. Any other prompt is not
+  answered (fail-closed): after `SWITCH_READ_TIMEOUT` seconds without new
+  output the error says `save did not complete` and that whether
+  startup-config was written is unknown, and includes the last line.
+  `show` and read-backs never answer a confirmation. The LGS328PC save
+  prompt text is not live-confirmed; keep `save_config` gated in the hub
+  until it is
+  ([#4](https://github.com/WackEarl/netmiko-mcp-linksys/issues/4)).
 
 ### Changed
 

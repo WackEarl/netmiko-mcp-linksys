@@ -62,6 +62,16 @@ PAGER_RE = re.compile(
 PAGE_BREAK = "\ue000"
 MAX_PAGES = 2000
 
+# Y/N confirmation at the end of the last visible line, e.g. "(y/n)",
+# "[Y/N]:", "(yes/no)?". The LGS328PC save prompt text is NOT live-confirmed
+# (issue #4). Only this shape is answered, and only once; anything else
+# runs into the idle timeout and fails without an answer (fail-closed).
+SAVE_CONFIRM_RE = re.compile(
+    r"(?:\(\s*y(?:es)?\s*/\s*n(?:o)?\s*\)|\[\s*y(?:es)?\s*/\s*n(?:o)?\s*\])\s*[:?]?\s*$",
+    re.IGNORECASE,
+)
+SAVE_CONFIRM_ANSWER = "y"
+
 _warned: set[str] = set()
 
 
@@ -380,12 +390,17 @@ def send_paged(
     *,
     timeout: float | None = None,
     poll_interval: float = 0.1,
+    confirm: tuple[re.Pattern[str], str] | None = None,
 ) -> str:
     """Send one exec command and read until the prompt, paging through pagers.
 
     Each time the last visible line matches PAGER_RE a single space is sent.
     Finishes when the last visible line is the device prompt. ``timeout`` is
     an idle timeout: the seconds allowed without any new output.
+
+    ``confirm=(pattern, answer)`` answers one confirmation prompt (last
+    visible line matches ``pattern``) with ``answer``. A second
+    confirmation prompt is not answered and raises ConnectionError.
     """
     limit = read_timeout() if timeout is None else timeout
     prompt_re = _prompt_regex(conn)
@@ -397,6 +412,7 @@ def send_paged(
     buffer = ""
     scan_from = 0
     pages = 0
+    confirms = 0
     deadline = time.monotonic() + limit
     while True:
         chunk = conn.read_channel()
@@ -414,6 +430,16 @@ def send_paged(
                 buffer = buffer[: cut + 1] if cut >= 0 else buffer[:scan_from]
                 buffer += PAGE_BREAK
                 conn.write_channel(" ")
+                scan_from = len(buffer)
+                continue
+            if confirm is not None and confirm[0].search(tail):
+                confirms += 1
+                if confirms > 1:
+                    raise ConnectionError(
+                        f"Unexpected second confirmation prompt after {command!r}; "
+                        f"not answered (last line: {redact_secrets(tail[-80:])!r})."
+                    )
+                conn.write_channel(confirm[1] + getattr(conn, "RETURN", "\n"))
                 scan_from = len(buffer)
                 continue
             if "\n" in buffer and prompt_re.search(tail):
@@ -628,13 +654,18 @@ def run_in_session(
 
 
 def run_save() -> str:
+    """Send 'save'; answer one Y/N confirmation with 'y' (prompt not live-confirmed)."""
     with session() as conn:
         try:
-            text = send_paged(conn, "save")
-        except ConnectionError:
-            raise
+            text = send_paged(conn, "save", confirm=(SAVE_CONFIRM_RE, SAVE_CONFIRM_ANSWER))
         except Exception as exc:
-            raise ConnectionError(redact_secrets(str(exc))) from None
+            # ConnectionError messages are already redacted; redact again
+            # for anything else (idempotent).
+            raise ConnectionError(
+                f"save did not complete: {redact_secrets(str(exc))} Whether "
+                "startup-config was written is unknown; check it before "
+                "saving again."
+            ) from None
     if config_output_is_error(text, commands=["save"]):
         raise ConnectionError("save failed:\n" + redact_secrets(text))
     return redact_secrets(text)
