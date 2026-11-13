@@ -61,15 +61,19 @@ SNMP_RESERVED_NAMES = frozenset(
 )
 
 
-# "snmp community name <secret> security" may wrap mid-secret (ISS
-# terminals are often ~80-144 columns). The community token is only
-# [A-Za-z0-9_] plus wrap whitespace, so this cannot eat later table
-# labels such as "Security Name". The keyword "security" is matched
-# case-sensitively (CLI spelling).
+# "snmp community name <payload> security" may wrap mid-secret (ISS
+# terminals are often ~80-144 columns). The payload may include wrap
+# whitespace, prompt redraws, or ANSI; the keyword "security" is
+# matched case-sensitively so this cannot eat later table labels such
+# as "Security Name". The three words "snmp community name" are only
+# space/tab-separated, so a "show snmp community" echo cannot open a
+# span.
 _COMMUNITY_CMD_SPAN_RE = re.compile(
-    r"snmp[ \t]+community[ \t]+name(?:\s|\\[nrt])+"
-    r"[A-Za-z0-9_\r\n\\]+"
-    r"(?:\s|\\[nrt])+security\b"
+    r"snmp[ \t]+community[ \t]+name"
+    r"(?:\s|\\[nrt])+"
+    r"[\s\S]+?"
+    r"(?:\s|\\[nrt])+"
+    r"security\b"
 )
 
 
@@ -90,22 +94,13 @@ def valid_community_for_redaction() -> str | None:
         return None
 
 
-# Hostname, optional (config…), then # or > — ISS/Cisco prompt redraws
-# that can land at the start of a wrapped continuation line.
-_PROMPT_REDRAW_RE = re.compile(
-    r"(^|[\r\n])[\w.\-]+(?:\([^)\r\n]*\))?[#>]\s*",
-)
-_SNMP_COMMUNITY_HINT_RE = re.compile(r"(?i)snmp\s+community")
-
-
-def prepare_text_for_redaction(text: str) -> str:
-    """Strip ANSI/control sequences and prompt redraws before secret redaction."""
-    text = strip_controls(text)
-    return _PROMPT_REDRAW_RE.sub(lambda match: match.group(1), text)
-
-
 def redact_community_command_spans(text: str) -> str:
-    """Replace a (possibly wrapped) community-config command with a redacted span."""
+    """Replace a (possibly wrapped) community-config command with a redacted span.
+
+    Each matched command span is replaced wholesale, which drops
+    mid-span wrap artifacts (ANSI, prompt redraws, or a leftover
+    ``$``) without rewriting text outside the span.
+    """
     return _COMMUNITY_CMD_SPAN_RE.sub(
         "snmp community name " + REDACTED_COMMUNITY + " security",
         text,
@@ -146,17 +141,15 @@ def redact_secrets(text: str) -> str:
     valid community, this function does not rewrite the text except for
     an exact password replacement.
 
-    ANSI and prompt redraws are stripped, and wrapped community-command
-    spans are redacted, only when the text contains ``snmp community``
-    (case-insensitive, whitespace-tolerant) *and* a valid community is
-    configured. That path may return a normalized copy. All other
-    output stays byte-identical except for those secret replacements.
+    Wrapped community-command spans (``snmp community name`` through
+    ``security``, whitespace- and newline-tolerant) are redacted when a
+    valid community is configured; ANSI and prompt redraws are
+    normalized only inside those spans. All other output stays
+    byte-identical except for those secret replacements.
     """
     community = valid_community_for_redaction()
     if community:
-        if _SNMP_COMMUNITY_HINT_RE.search(text):
-            text = prepare_text_for_redaction(text)
-            text = redact_community_command_spans(text)
+        text = redact_community_command_spans(text)
         text = _replace_secret_and_variants(text, community, REDACTED_COMMUNITY)
     password = os.environ.get("SWITCH_PASSWORD") or ""
     if password and password in text:
