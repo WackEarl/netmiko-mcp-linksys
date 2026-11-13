@@ -55,6 +55,8 @@ from netmiko_mcp_linksys.snmp_cli import (
     build_user_remove_commands,
     build_view_create_commands,
     build_write_view_commands,
+    case_variant_note,
+    case_variant_view_names,
     compact_oid,
     format_sent_commands,
     normalize_subtree,
@@ -581,6 +583,25 @@ def _verification_failed(exc: BaseException) -> SwitchConnectionError:
     )
 
 
+def _reject_case_variant_view(views: list[ViewSubtree], view_name: str) -> None:
+    variants = case_variant_view_names(views, view_name)
+    if variants:
+        note = case_variant_note(view_name, variants)
+        raise ValidationError(note[:1].upper() + note[1:] + ". Use a distinct view name.")
+
+
+def _precheck_view_name_unambiguous(conn: Any, view_name: str) -> None:
+    """Refuse a view name that differs from an existing one only in case."""
+    views = parse_snmp_viewtree(_snmp_exec(conn, READBACK_SNMP_VIEW))
+    if not views:
+        raise ValidationError(
+            "Could not parse show snmp viewtree (unknown table layout). "
+            "Refusing to change a view until it is verified that no view "
+            "name differs from it only in letter case."
+        )
+    _reject_case_variant_view(views, view_name)
+
+
 def _precheck_poe_read_view(conn: Any, view_name: str) -> None:
     """Refuse POWER-ETHERNET-MIB in a view that is (or looks like) a write view."""
     accesses = parse_snmp_access(_snmp_exec(conn, READBACK_SNMP_ACCESS))
@@ -590,7 +611,11 @@ def _precheck_poe_read_view(conn: Any, view_name: str) -> None:
             "Refusing to add POWER-ETHERNET-MIB until it is verified that "
             "the view is not used for write access."
         )
-    if any(item.write_view.strip().lower() == view_name.lower() for item in accesses):
+    # casefold here only widens the refusal (fail-closed); the viewtree
+    # check below refuses case-only variants explicitly.
+    if any(
+        item.write_view.strip().casefold() == view_name.casefold() for item in accesses
+    ):
         raise ValidationError(
             f"View {view_name!r} is used as a write view. POWER-ETHERNET-MIB "
             "may only be added to a read view."
@@ -601,8 +626,9 @@ def _precheck_poe_read_view(conn: Any, view_name: str) -> None:
             "Could not parse show snmp viewtree (unknown table layout). "
             "Refusing to add POWER-ETHERNET-MIB until the view is verified."
         )
+    _reject_case_variant_view(views, view_name)
     if any(
-        item.name.lower() == view_name.lower()
+        item.name == view_name
         and item.oid.strip().startswith(IF_ADMIN_STATUS_OID + ".")
         for item in views
     ):
@@ -632,13 +658,15 @@ def snmp_view_create(view_name: str, subtree: str) -> str:
         def _run(conn: Any) -> str:
             if oid == POE_SUBTREE:
                 _precheck_poe_read_view(conn, view_name)
+            else:
+                _precheck_view_name_unambiguous(conn, view_name)
             _send_config(conn, commands)
             try:
                 view_out = _snmp_exec(conn, READBACK_SNMP_VIEW)
             except Exception as exc:  # noqa: BLE001 — must wrap any post-send failure
                 raise _verification_failed(exc) from None
             present = any(
-                item.name.lower() == view_name.lower() and item.oid == oid
+                item.name == view_name and item.oid == oid
                 for item in parse_snmp_viewtree(view_out)
             )
             if present:
@@ -732,9 +760,13 @@ def snmp_write_view_create(view_name: str, subtree: str) -> str:
 
 
 def _precheck_write_view_target(views: list[ViewSubtree], view_name: str) -> None:
-    """Refuse to turn a view with non-write subtrees (e.g. PoE) into a write view."""
+    """Refuse to turn a view with non-write subtrees (e.g. PoE) into a write view.
+
+    Also refuses a name that differs from an existing view only in case.
+    """
+    _reject_case_variant_view(views, view_name)
     for item in views:
-        if item.name.lower() != view_name.lower():
+        if item.name != view_name:
             continue
         if item.view_type in {"excluded", "exclude"}:
             continue
@@ -761,8 +793,8 @@ def _precheck_view_for_community(
             "the view list is empty). Refusing to create a community until "
             "the view can be verified. Confirm the output format live."
         )
-    names = {item.name.lower() for item in views}
-    if view_name.lower() not in names:
+    names = {item.name for item in views}
+    if view_name not in names:
         raise ValidationError(
             f"View {view_name!r} was not found in show snmp viewtree. "
             "Create it with snmp_view_create first."

@@ -23,6 +23,7 @@ from netmiko_mcp_linksys.snmp_cli import (
     build_user_remove_commands,
     build_view_create_commands,
     build_write_view_commands,
+    case_variant_view_names,
     format_sent_commands,
     group_name_for_view,
     mask_is_exact,
@@ -2043,3 +2044,181 @@ def test_snmp_community_remove_refuses_rw_without_ifindexes(
     assert result.startswith("Rejected:")
     assert "SWITCH_SNMP_PROTECTED_IFINDEXES" in result
     assert SECRET not in result
+
+
+# ---------------------------------------------------------------------------
+# View names are compared exactly; case-only variants are refused
+# (Cody, PR #8 review of 063cfd7). It is not live-confirmed whether ISS
+# treats view names case-sensitively, so a "wv"/"WV" pair is ambiguous.
+# ---------------------------------------------------------------------------
+
+CASE_SPLIT_VIEWS = _views(
+    # "wv" is a read view without exclusions; "WV" is a complete write view.
+    _view_block("wv", "1.3.6.1.2.1.2", "included"),
+    _view_block("WV", EXCLUDED_OIDS[0], "excluded"),
+    _view_block("WV", EXCLUDED_OIDS[1], "excluded"),
+    _view_block("WV", "1.3.6.1.2.1.2", "included"),
+)
+
+
+def test_case_variant_view_names() -> None:
+    views = parse_snmp_viewtree(CASE_SPLIT_VIEWS)
+    assert case_variant_view_names(views, "wv") == ["WV"]
+    assert case_variant_view_names(views, "WV") == ["wv"]
+    assert case_variant_view_names(views, "Wv") == ["WV", "wv"]
+    assert case_variant_view_names(views, "other") == []
+
+
+@pytest.mark.parametrize("name", ["wv", "WV"])
+def test_view_is_write_safe_refuses_case_merge(name: str) -> None:
+    ok, note = view_is_write_safe(parse_snmp_viewtree(CASE_SPLIT_VIEWS), name, EXCLUDED_OIDS)
+    assert not ok
+    assert "differs only in letter case" in note
+
+
+def test_view_checks_are_case_sensitive() -> None:
+    views = parse_snmp_viewtree(WRITE_VIEW_OK)
+    ok, note = view_is_write_safe(views, "IFMIB_W", EXCLUDED_OIDS)
+    assert not ok
+    assert "differs only in letter case" in note
+    ok, note = view_is_restricted(parse_snmp_viewtree(VIEW_SHOW_RESTRICTED), "IFMIB")
+    assert not ok
+    assert "differs only in letter case" in note
+
+
+def test_cody_probe_r5(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Port of Cody's probe /tmp/cody/r5.py (write view hardening)."""
+    from netmiko_mcp_linksys.snmp_cli import required_write_exclusions
+
+    monkeypatch.setenv("SWITCH_PROTECTED_PORTS", "0/10,0/24")
+    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", "0/10=10,0/24=24")
+    ex = required_write_exclusions()
+    assert ex == ["1.3.6.1.2.1.2.2.1.7.10", "1.3.6.1.2.1.2.2.1.7.24"]
+    assert build_write_view_commands("wv", "1.3.6.1.2.1.2", ex) == [
+        "snmp view wv 1.3.6.1.2.1.2.2.1.7.10 excluded",
+        "snmp view wv 1.3.6.1.2.1.2.2.1.7.24 excluded",
+        "snmp view wv 1.3.6.1.2.1.2 included",
+    ]
+    for subtree in ("power-ethernet", "1.3.6.1.2.1.105", "1.3.6.1.2.1.105.1.1.1.3", "1.3.6.1"):
+        with pytest.raises(ValidationError):
+            normalize_write_subtree(subtree)
+
+    def blk(name: str, oid: str, typ: str, mask: str = "") -> str:
+        return f"View Name: {name}\nSubtree OID: {oid}\nSubtree Mask: {mask}\nView Type: {typ}\n"
+
+    def tree(*blocks: str) -> list[Any]:
+        return parse_snmp_viewtree("\n------------------------------\n".join(blocks))
+
+    good = [
+        blk("wv", "1.3.6.1.2.1.2.2.1.7.10", "excluded"),
+        blk("wv", "1.3.6.1.2.1.2.2.1.7.24", "excluded"),
+        blk("wv", "1.3.6.1.2.1.2", "included"),
+    ]
+    assert view_is_write_safe(tree(*good), "wv", ex)[0]
+    ok, note = view_is_write_safe(tree(*good, blk("wv", "1.3.6.1.2.1.105", "included")), "wv", ex)
+    assert not ok
+    assert "POWER-ETHERNET-MIB" in note
+    # Case merge: "wv" lacks the exclusions, "WV" has them.
+    case_merge = tree(
+        blk("wv", "1.3.6.1.2.1.2", "included"),
+        blk("WV", "1.3.6.1.2.1.2.2.1.7.10", "excluded"),
+        blk("WV", "1.3.6.1.2.1.2.2.1.7.24", "excluded"),
+        blk("WV", "1.3.6.1.2.1.2", "included"),
+    )
+    ok, note = view_is_write_safe(case_merge, "wv", ex)
+    assert not ok
+    assert "differs only in letter case" in note
+    leading_dot = tree(
+        blk("wv", ".1.3.6.1.2.1.2.2.1.7.10", "excluded"),
+        blk("wv", ".1.3.6.1.2.1.2.2.1.7.24", "excluded"),
+        blk("wv", "1.3.6.1.2.1.2", "included"),
+    )
+    assert not view_is_write_safe(leading_dot, "wv", ex)[0]
+    wildcard = tree(*good[:2], blk("wv", "1.3.6.1.2.1.2", "included", "ff:7f"))
+    assert not view_is_write_safe(wildcard, "wv", ex)[0]
+    for ports, idx in [
+        (None, "0/10=10"),
+        ("", "0/10=10"),
+        ("0/10,0/24", None),
+        ("0/10,0/24", "0/10=10"),
+        ("0/10", "0/10=10,0/24=24"),
+        ("0/10", "0/10=010"),
+        ("0/10", "0/10=0"),
+        ("0/10,0/24", "0/10=5,0/24=5"),
+    ]:
+        for key, value in (("SWITCH_PROTECTED_PORTS", ports), ("SWITCH_SNMP_PROTECTED_IFINDEXES", idx)):
+            if value is None:
+                monkeypatch.delenv(key, raising=False)
+            else:
+                monkeypatch.setenv(key, value)
+        with pytest.raises(ValidationError):
+            parse_protected_ifindexes()
+
+
+def test_attack_path_write_view_case_variant_refused_before_send() -> None:
+    """snmp_view_create("wv") then snmp_write_view_create("WV") must fail."""
+    from netmiko_mcp_linksys.server import snmp_write_view_create
+
+    read_only_wv = _views(
+        VIEW_SHOW_RESTRICTED, _view_block("wv", "1.3.6.1.2.1.2", "included")
+    )
+    sent: list[list[str]] = []
+    session = _fake_snmp_session({READBACK_SNMP_VIEW: read_only_wv}, sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_write_view_create("WV", "interfaces")
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert "differs only in letter case" in result
+
+
+def test_attack_path_community_rw_case_variant_refused(community_env: str) -> None:
+    """A community with write view "wv" must not pass via the "WV" exclusions."""
+    from netmiko_mcp_linksys.server import snmp_community_create
+
+    listing = _rw_listing(_views(VIEW_SHOW_RESTRICTED, CASE_SPLIT_VIEWS))
+    sent: list[list[str]] = []
+    with patch(
+        "netmiko_mcp_linksys.server.run_in_session",
+        side_effect=_fake_snmp_session(listing, sent),
+    ):
+        result = snmp_community_create("ifmib", "rw", "wv")
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert "differs only in letter case" in result
+    assert SECRET not in result
+
+
+@pytest.mark.parametrize(
+    ("view", "subtree", "access"),
+    [
+        ("WV", "interfaces", ACCESS_SHOW_RW),
+        ("IFMIB", "interfaces", ACCESS_SHOW_RW),
+        # Read view case variant of an existing view: PoE path.
+        ("IFMIB", "power-ethernet", ACCESS_SHOW_RW),
+    ],
+)
+def test_snmp_view_create_refuses_case_variant(view: str, subtree: str, access: str) -> None:
+    from netmiko_mcp_linksys.server import snmp_view_create
+
+    views = _views(VIEW_SHOW_RESTRICTED, _view_block("wv", "1.3.6.1.2.1.2", "included"))
+    sent: list[list[str]] = []
+    session = _fake_snmp_session(
+        {READBACK_SNMP_VIEW: views, READBACK_SNMP_ACCESS: access}, sent
+    )
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_view_create(view, subtree)
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert "differs only in letter case" in result
+
+
+def test_snmp_view_create_refuses_unparseable_viewtree() -> None:
+    from netmiko_mcp_linksys.server import snmp_view_create
+
+    sent: list[list[str]] = []
+    session = _fake_snmp_session({READBACK_SNMP_VIEW: "garbage without keys"}, sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_view_create("ifmib", "interfaces")
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert "Could not parse show snmp viewtree" in result

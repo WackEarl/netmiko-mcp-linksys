@@ -519,10 +519,37 @@ def compact_oid(oid: str) -> str:
     return oid.strip().rstrip(".")
 
 
+def case_variant_view_names(entries: list[ViewSubtree], view_name: str) -> list[str]:
+    """Other view names that differ from ``view_name`` only in letter case.
+
+    It is not known whether ISS treats view names case-sensitively, so such
+    a pair is ambiguous: the device may merge them (or not) while our checks
+    see two views. Callers must refuse (fail-closed).
+    """
+    target = view_name.casefold()
+    return sorted(
+        {
+            entry.name
+            for entry in entries
+            if entry.name != view_name and entry.name.casefold() == target
+        }
+    )
+
+
+def case_variant_note(view_name: str, variants: list[str]) -> str:
+    return (
+        f"view {view_name!r} differs only in letter case from existing "
+        f"view(s) {', '.join(repr(name) for name in variants)} (refusing: "
+        "it is not confirmed whether the switch treats view names "
+        "case-sensitively)"
+    )
+
+
 def view_included_oids(entries: list[ViewSubtree], view_name: str) -> list[str]:
+    """Included subtrees of exactly ``view_name`` (case-sensitive)."""
     oids: list[str] = []
     for entry in entries:
-        if entry.name.lower() != view_name.lower():
+        if entry.name != view_name:
             continue
         if entry.view_type and entry.view_type not in {"included", "include"}:
             continue
@@ -532,11 +559,14 @@ def view_included_oids(entries: list[ViewSubtree], view_name: str) -> list[str]:
 
 def view_is_restricted(entries: list[ViewSubtree], view_name: str) -> tuple[bool, str]:
     """True if every included subtree of the view is on the OID allowlist."""
+    variants = case_variant_view_names(entries, view_name)
+    if variants:
+        return False, case_variant_note(view_name, variants)
     oids = view_included_oids(entries, view_name)
     if not oids:
         return False, f"view {view_name!r} has no included subtrees in the read-back"
     for entry in entries:
-        if entry.name.lower() == view_name.lower() and not mask_is_exact(entry.mask):
+        if entry.name == view_name and not mask_is_exact(entry.mask):
             return False, (
                 f"view {view_name!r} has subtree {entry.oid} with an "
                 "unrecognised mask (could be a wildcard)"
@@ -573,7 +603,10 @@ def view_is_write_safe(
         return False, (
             f"no ifAdminStatus exclusions configured for write view {view_name!r}"
         )
-    own = [entry for entry in entries if entry.name.lower() == view_name.lower()]
+    variants = case_variant_view_names(entries, view_name)
+    if variants:
+        return False, "write " + case_variant_note(view_name, variants)
+    own = [entry for entry in entries if entry.name == view_name]
     if not own:
         return False, f"write view {view_name!r} was not found in the read-back"
     included: list[str] = []
