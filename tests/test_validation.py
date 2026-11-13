@@ -58,7 +58,7 @@ def test_valid_descriptions(text: str) -> None:
 
 @pytest.mark.parametrize(
     "text",
-    ["", "x" * 33, 'bad"quote', "bad'quote", "why?", "pipe|me", "line\nbreak", "ümlaut"],
+    ["", "x" * 33, 'bad"quote', "bad'quote", "why?", "pipe|me", "line\nbreak", "ümlaut", "%", "100%", "pre%post"],
 )
 def test_invalid_descriptions(text: str) -> None:
     with pytest.raises(ValidationError, match="Invalid description"):
@@ -161,6 +161,13 @@ def test_reject_unsafe_show_command_direct() -> None:
     assert reject_unsafe_show_command("show system information") == "show system information"
 
 
+def _description_commands(description: str) -> list[str]:
+    return [
+        "interface gigabitethernet 0/7",
+        f'description "{description}"',
+    ]
+
+
 def _config_echo(description: str) -> str:
     return (
         "configure terminal\r\n"
@@ -173,8 +180,17 @@ def _config_echo(description: str) -> str:
 
 @pytest.mark.parametrize("description", ["Error LED", "Invalid Port"])
 def test_config_output_ignores_error_words_in_echoed_description(description: str) -> None:
-    assert config_output_is_error(_config_echo(description)) is False
-    assert config_output_is_error(f'description "{description}"') is False
+    commands = _description_commands(description)
+    assert config_output_is_error(_config_echo(description), commands) is False
+    # Echoed command, with and without a leading prompt prefix.
+    assert config_output_is_error(f'description "{description}"', commands) is False
+    assert (
+        config_output_is_error(
+            f'LGS328PC(config-if)# description "{description}"',
+            commands,
+        )
+        is False
+    )
 
 
 def test_config_output_detects_iss_percent_error() -> None:
@@ -190,20 +206,28 @@ def test_config_output_detects_iss_percent_error() -> None:
     assert config_output_is_error("  % Invalid input detected at '^' marker.  ") is True
 
 
+def test_config_output_percent_on_same_line_as_prompt() -> None:
+    assert config_output_is_error("LGS328PC(config-if)#% Invalid input") is True
+    assert config_output_is_error("LGS328PC(config-if)# % Invalid input detected") is True
+
+
 def test_config_output_percent_error_still_wins_with_error_description() -> None:
     mixed = (
         _config_echo("Error LED")
         + "\r\n% Invalid input detected at '^' marker.\r\n"
         + "LGS328PC#"
     )
-    assert config_output_is_error(mixed) is True
+    assert config_output_is_error(mixed, _description_commands("Error LED")) is True
 
 
-def test_config_output_ignores_error_words_without_percent() -> None:
-    assert config_output_is_error("Error") is False
-    assert config_output_is_error("Invalid input") is False
+def test_config_output_flags_bare_error_or_invalid_words() -> None:
+    assert config_output_is_error("Error: port is protected") is True
+    assert config_output_is_error("Error") is True
+    assert config_output_is_error("Invalid input") is True
+    assert config_output_is_error("LGS328PC# Error: port is protected") is True
     assert config_output_is_error("") is False
     assert config_output_is_error("LGS328PC#") is False
+    assert config_output_is_error("LGS328PC(config-if)#") is False
 
 
 def test_config_output_detects_ansi_prefixed_percent_error() -> None:
@@ -211,3 +235,9 @@ def test_config_output_detects_ansi_prefixed_percent_error() -> None:
     assert config_output_is_error("\x1b[31m% Invalid input detected\x1b[0m") is True
     # Terminated OSC (BEL) is stripped; the following '%' error still counts.
     assert config_output_is_error("\x1b]0;title\x07% Invalid input detected") is True
+
+
+def test_validate_description_rejects_percent() -> None:
+    for text in ("%", "100%", "pre%post", "%LED"):
+        with pytest.raises(ValidationError, match="Invalid description"):
+            validate_description(text)

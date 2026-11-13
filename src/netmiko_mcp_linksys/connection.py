@@ -189,7 +189,7 @@ def disable_paging_best_effort(conn: Any) -> None:
     except Exception as exc:
         warn(f"paging-off sequence failed ({exc}); relying on pager handling.", once_key="paging")
         return
-    if config_output_is_error(str(output)):
+    if config_output_is_error(str(output), list(PAGING_OFF_CONFIG)):
         warn(
             "switch rejected 'set cli pagination off'; relying on pager handling.",
             once_key="paging",
@@ -379,7 +379,7 @@ def _send_config(conn: Any, commands: list[str]) -> str:
     except Exception as exc:
         raise ConnectionError(redact_secrets(str(exc))) from None
     text = output if isinstance(output, str) else str(output)
-    if config_output_is_error(text):
+    if config_output_is_error(text, commands):
         raise ConnectionError(
             "Device rejected the configuration sequence:\n" + redact_secrets(text)
         )
@@ -417,6 +417,6 @@ def run_save() -> str:
             raise
         except Exception as exc:
             raise ConnectionError(redact_secrets(str(exc))) from None
-    if config_output_is_error(text):
+    if config_output_is_error(text, ["save"]):
         raise ConnectionError("save failed:\n" + redact_secrets(text))
     return text

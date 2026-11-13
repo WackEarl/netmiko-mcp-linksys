@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 
 from netmiko_mcp_linksys.output import strip_controls
 
@@ -110,23 +111,52 @@ def reject_if_protected(port: str, *, disabling: bool, action: str) -> None:
         )
 
 
-def config_output_is_error(output: str) -> bool:
-    """Treat ISS/IOS-style error lines (starting with '%') as failure.
+# Hostname, optional (config…) mode, then # or >. Used to drop a leading
+# prompt so echoed commands and prompt-only lines can be skipped.
+_PROMPT_PREFIX_RE = re.compile(r"^[\w.\-]+(?:\([^)\r\n]*\))?[#>]\s*")
+_ERROR_WORD_RE = re.compile(r"\b(?:Error|Invalid)\b", re.IGNORECASE)
 
-    Prompt lines and echoed command lines are ignored, so a description
-    such as "Error LED" or "Invalid Port" is not treated as a rejection.
-    Only lines that start with '%' after ANSI/control stripping count
-    (the LGS/ISS format is "% Invalid input detected at '^' marker.").
-    Each line is run through strip_controls first (same helper as the
-    output cleanup, including the terminated-OSC rule) so a colored
-    error such as CSI-prefixed "% Invalid input" is still detected.
+
+def _line_without_prompt(line: str) -> str:
+    match = _PROMPT_PREFIX_RE.match(line)
+    if match is None:
+        return line
+    return line[match.end() :].strip()
+
+
+def config_output_is_error(
+    output: str,
+    commands: Sequence[str] | None = None,
+) -> bool:
+    """Classify switch config/save output as a device rejection.
+
+    Each line is first run through strip_controls (same helper as the
+    output cleanup, including the terminated-OSC rule). After that:
+
+    * If the line contains '%' anywhere, it is an error. That includes a
+      prompt and an error on the same line, e.g.
+      ``LGS328PC(config-if)#% Invalid input``. Sent commands cannot
+      contain '%' (descriptions allow only [A-Za-z0-9 ._-]).
+    * A leading prompt (hostname, optional ``(config…)``, then ``#`` or
+      ``>``) is removed. An empty remainder (prompt-only) is skipped.
+    * If the remainder equals one of the commands just sent, the line is
+      an echo and is skipped.
+    * Otherwise the words ``Error`` and ``Invalid`` (case-insensitive)
+      are treated as a failure, so a line such as
+      ``Error: port is protected`` is caught.
     """
     if not output:
         return False
+    sent = {command.strip() for command in (commands or ()) if command.strip()}
     for line in output.splitlines():
         stripped = strip_controls(line).strip()
         if not stripped:
             continue
-        if stripped.startswith("%"):
+        if "%" in stripped:
+            return True
+        remainder = _line_without_prompt(stripped)
+        if not remainder or remainder in sent:
+            continue
+        if _ERROR_WORD_RE.search(remainder):
             return True
     return False

@@ -189,7 +189,14 @@ Confirmed on LGS328PC, firmware 1.01.02.02 (0.1.0 and 0.1.1 live tests):
 - The pager loop completes long outputs (`show interfaces status`,
   `show power inline`, `show interfaces gigabitethernet 0/24`), tested with
   `SWITCH_PAGING_OFF=0`.
-- Invalid commands return `%` / `Invalid` (the error heuristic).
+- Error heuristic: after ANSI/control stripping, a line is a failure if it
+  contains `%` anywhere (including a same-line prompt such as
+  `LGS328PC(config-if)#% Invalid input`), or if — after removing a leading
+  prompt (`hostname`, optional `(config…)`, then `#` or `>`) — the remainder
+  is not empty, is not one of the commands just sent, and contains the word
+  `Error` or `Invalid` (case-insensitive). Echoed commands such as
+  `description "Error LED"` are skipped. Invalid commands on this firmware
+  return `% Invalid input detected` (confirmed live).
 - `description <two words>` unquoted is rejected (`% Invalid input detected`
   at the second word); fixed in 0.1.2 by quoting.
 

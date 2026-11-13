@@ -9,13 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `config_output_is_error` now only treats lines that start with `%` as
-  device errors, so echoed commands and prompts are ignored. Allowed
-  descriptions such as `Error LED` and `Invalid Port` are no longer
-  reported as rejected when the configuration was accepted. Each line is
-  run through the same ANSI/control stripper as the output cleanup
-  (including the terminated-OSC rule) before the `%` check, so a
-  color-prefixed `% Invalid input` is still detected
+- `config_output_is_error` classifies device output after ANSI/control
+  stripping (same helper as the output cleanup, including the
+  terminated-OSC rule). A line is a failure if it contains `%` anywhere
+  (including a same-line prompt such as
+  `LGS328PC(config-if)#% Invalid input`), or if after removing a leading
+  prompt the remainder is not empty, is not one of the commands just
+  sent, and contains the word `Error` or `Invalid` (case-insensitive).
+  Echoed descriptions such as `description "Error LED"` are therefore
+  not reported as rejected; a separate line like
+  `Error: port is protected` is
   ([#3](https://github.com/WackEarl/netmiko-mcp-linksys/issues/3)).
 
 ## [0.1.2] - 2026-11-12
