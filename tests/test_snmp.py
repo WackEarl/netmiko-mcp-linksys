@@ -751,7 +751,8 @@ def test_show_snmp_bare_still_denied(reset_command_file: None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Regression tests from Cody's security probes (probe.py, probe2.py, p3.py, p5.py)
+# Regression tests from Cody's security probes (probe.py, probe2.py, p3.py, p5.py,
+# re1.py, re2.py)
 # ---------------------------------------------------------------------------
 
 
@@ -860,7 +861,8 @@ def test_cody_wrapped_echo_does_not_leak(monkeypatch: pytest.MonkeyPatch, audit_
     assert not _secret_in(result, secret)
     assert secret[:12] not in result
     assert secret[12:] not in result
-    assert "[REDACTED]" in result or "exception text is omitted" in result or "Invalid input" in result
+    assert "device output is omitted" in result
+    assert "Invalid input" not in result
     assert not _secret_in(audit_log.read_text(encoding="utf-8"), secret)
 
 
@@ -884,6 +886,8 @@ def test_cody_wrapped_echo_at_column_60(monkeypatch: pytest.MonkeyPatch) -> None
     assert not _secret_in(result, secret)
     frag = secret[60 - len("snmp community name ") :] if 60 > len("snmp community name ") else secret
     assert frag not in result or frag == ""
+    assert "device output is omitted" in result
+    assert "Invalid input" not in result
 
 
 def test_cody_short_invalid_env_does_not_mangle_output(
@@ -1146,3 +1150,242 @@ def test_cody_readback_exception_after_send_is_verification_failed(
     assert record["allowed"] is True
     assert not _secret_in(record["result"], SECRET)
 
+
+
+
+def test_cody_wrapped_echo_with_prompt_redraw_omits_device_text(
+    monkeypatch: pytest.MonkeyPatch, audit_log
+) -> None:
+    """Retest A: a mid-wrap prompt redraw must not leak, and device text is omitted."""
+    secret = "HaIfMibComm9xLong_42"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", secret)
+    cut = len("snmp community name ") + 8
+
+    def cfg_wrap(cmds: list[str]) -> str:
+        line = cmds[-1]
+        return (
+            f"LGS(config)# {line[:cut]}\r\n"
+            f"LGS(config)# {line[cut:]}\r\n"
+            "% Invalid input detected\r\nLGS(config)#"
+        )
+
+    result = _run_snmp_tool(
+        "snmp_community_create",
+        _FakeConn(cfg_wrap),
+        {READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED},
+        "ifmib",
+        "ro",
+    )
+    assert not _secret_in(result, secret)
+    assert secret[:8] not in result
+    assert secret[8:] not in result
+    assert "device output is omitted" in result
+    assert "Invalid input" not in result
+    assert "LGS(config)" not in result
+    assert not _secret_in(audit_log.read_text(encoding="utf-8"), secret)
+
+
+def test_cody_wrapped_echo_with_ansi_erase_omits_device_text(
+    monkeypatch: pytest.MonkeyPatch, audit_log
+) -> None:
+    """Retest A: ANSI erase mid-wrap must not leak, and device text is omitted."""
+    secret = "HaIfMibComm9xLong_42"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", secret)
+    cut = len("snmp community name ") + 8
+
+    def cfg_wrap(cmds: list[str]) -> str:
+        line = cmds[-1]
+        return (
+            f"LGS(config)# {line[:cut]}\r\n"
+            f"\x1b[K{line[cut:]}\r\n"
+            "% Invalid input detected\r\nLGS(config)#"
+        )
+
+    result = _run_snmp_tool(
+        "snmp_community_create",
+        _FakeConn(cfg_wrap),
+        {READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED},
+        "ifmib",
+        "ro",
+    )
+    assert not _secret_in(result, secret)
+    assert secret[:8] not in result
+    assert secret[8:] not in result
+    assert "device output is omitted" in result
+    assert "Invalid input" not in result
+    assert not _secret_in(audit_log.read_text(encoding="utf-8"), secret)
+
+
+def test_cody_wrapped_echo_with_dollar_scroll_omits_device_text(
+    monkeypatch: pytest.MonkeyPatch, audit_log
+) -> None:
+    """Retest A: a '$' scroll leftover mid-wrap must not leak, and device text is omitted."""
+    secret = "HaIfMibComm9xLong_42"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", secret)
+    cut = len("snmp community name ") + 8
+
+    def cfg_wrap(cmds: list[str]) -> str:
+        line = cmds[-1]
+        return (
+            f"LGS(config)# {line[:cut]}\r\n"
+            f"${line[cut:]}\r\n"
+            "% Invalid input detected\r\nLGS(config)#"
+        )
+
+    result = _run_snmp_tool(
+        "snmp_community_create",
+        _FakeConn(cfg_wrap),
+        {READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED},
+        "ifmib",
+        "ro",
+    )
+    assert not _secret_in(result, secret)
+    assert secret[:8] not in result
+    assert secret[8:] not in result
+    assert "device output is omitted" in result
+    assert "Invalid input" not in result
+    assert not _secret_in(audit_log.read_text(encoding="utf-8"), secret)
+
+
+def test_cody_redact_secrets_strips_ansi_and_prompt_redraws(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retest A: elsewhere, ANSI and prompt redraws are stripped before redaction."""
+    from netmiko_mcp_linksys.validation import redact_secrets
+
+    secret = "HaIfMibComm9xLong_42"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", secret)
+    cut = 12
+    with_prompt = (
+        f"snmp community name {secret[:cut]}\r\n"
+        f"LGS(config)# {secret[cut:]} security ifmib_sec\n"
+    )
+    with_ansi = (
+        f"snmp community name {secret[:cut]}\r\n"
+        f"\x1b[K{secret[cut:]} security ifmib_sec\n"
+    )
+    for raw in (with_prompt, with_ansi):
+        redacted = redact_secrets(raw)
+        assert not _secret_in(redacted, secret)
+        assert secret[:cut] not in redacted
+        assert secret[cut:] not in redacted
+        assert "[REDACTED]" in redacted
+        assert "\x1b" not in redacted
+        assert "LGS(config)" not in redacted
+
+
+def test_cody_readback_readtimeout_after_send_is_verification_failed(
+    community_env: str, audit_log
+) -> None:
+    """Retest B: a raw ReadTimeout after send is verification-failed, allowed=True."""
+    from netmiko.exceptions import ReadTimeout
+
+    def cfg(_cmds: list[str]) -> str:
+        return "ok"
+
+    def later(_conn: Any, command: str, *_a: Any, **_k: Any) -> str:
+        if command == READBACK_SNMP_VIEW and later.calls == 0:
+            later.calls += 1
+            return VIEW_SHOW_RESTRICTED
+        raise ReadTimeout(f"timed out reading after {SECRET}")
+
+    later.calls = 0  # type: ignore[attr-defined]
+
+    from netmiko_mcp_linksys import connection, server
+
+    with (
+        patch.object(connection, "connect_params", lambda **_k: {}),
+        patch.object(connection, "ConnectHandler", lambda **_k: _FakeConn(cfg)),
+        patch.object(connection, "disable_paging_best_effort", lambda _c: None),
+        patch.object(connection, "send_paged", later),
+        patch.object(server, "send_paged", later),
+    ):
+        result = server.snmp_community_create("ifmib", "ro")
+    assert result.startswith("Error: Configuration was sent, verification failed")
+    assert not _secret_in(result, SECRET)
+    record = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["allowed"] is True
+    assert not _secret_in(record["result"], SECRET)
+
+
+def test_cody_show_tool_disables_session_log_for_snmp_shows(
+    community_env: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retest C: show snmp community/viewtree/user must not open a session log."""
+    from netmiko_mcp_linksys import connection, server
+
+    log = tmp_path / "session.log"
+    monkeypatch.setenv("SWITCH_SESSION_LOG", str(log))
+    captured: dict[str, Any] = {}
+
+    def fake_handler(**params: Any) -> _FakeConn:
+        captured.clear()
+        captured.update(params)
+        return _FakeConn("ok")
+
+    def fake_paged(_conn: Any, command: str, *_a: Any, **_k: Any) -> str:
+        mapping = {
+            "show snmp community": COMMUNITY_SHOW,
+            "show snmp viewtree": VIEW_SHOW_RESTRICTED,
+            "show snmp user": USER_SHOW,
+            "show system information": "INFO",
+        }
+        return mapping.get(command, "")
+
+    with (
+        patch.object(connection, "ConnectHandler", fake_handler),
+        patch.object(connection, "disable_paging_best_effort", lambda _c: None),
+        patch.object(connection, "send_paged", fake_paged),
+        patch.object(server, "send_paged", fake_paged),
+    ):
+        for command in (
+            "show snmp community",
+            "show snmp viewtree",
+            "show snmp user",
+        ):
+            result = server.show(command)
+            assert "session_log" not in captured, command
+            assert not _secret_in(result, SECRET)
+        server.show("show system information")
+        assert "session_log" in captured
+    assert not log.exists() or log.read_text(encoding="utf-8") == ""
+
+
+def test_cody_session_log_redacts_community_name_by_label(
+    tmp_path, community_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retest C / re2: Community Name fields are masked even if not the env secret."""
+    foreign = "OldSecretComm77"
+    path = tmp_path / "session.log"
+    path.write_text(
+        "LGS# show snmp community\n"
+        "Community Index: old\n"
+        f"Community Name: {foreign}\n"
+        "Security Name: old_sec\n"
+        "------\n"
+        f"Community Name: {SECRET}\n"
+        "Security Name: ifmib_sec\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SWITCH_SESSION_LOG", str(path))
+    redact_session_log_file()
+    body = path.read_text(encoding="utf-8")
+    assert foreign not in body
+    assert SECRET not in body
+    assert "Community Name: [REDACTED]" in body
+    assert "Community Index: old" in body
+    assert "Security Name: old_sec" in body
+
+
+def test_cody_no_terminal_width_helper() -> None:
+    """Retest D: cisco_s300 already sends terminal width 511; no extra helper."""
+    import inspect
+
+    from netmiko_mcp_linksys import connection
+
+    assert not hasattr(connection, "_set_terminal_width_best_effort")
+    assert "wide_terminal" not in inspect.signature(connection.session).parameters
+    assert "wide_terminal" not in inspect.signature(connection.run_in_session).parameters
+    assert "wide_terminal" not in inspect.signature(
+        connection.run_config_and_readbacks
+    ).parameters

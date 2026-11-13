@@ -130,6 +130,13 @@ _COMMUNITY_NAME_LABEL_RE = re.compile(
 )
 
 
+def redact_community_name_fields(text: str) -> str:
+    """Mask values after a Community Name / CommunityName label, per field."""
+    return _COMMUNITY_NAME_LABEL_RE.sub(
+        lambda match: match.group(1) + REDACTED, text
+    )
+
+
 def group_name_for_view(view_name: str) -> str:
     return f"{view_name}_grp"
 
@@ -399,9 +406,7 @@ def redact_community_listing(text: str, *, names: list[str] | None = None) -> st
         prefix = text[: match.end()] if match else ""
         return prefix + UNPARSEABLE_COMMUNITY_LISTING
     redacted = redact_secrets(text)
-    redacted = _COMMUNITY_NAME_LABEL_RE.sub(
-        lambda match: match.group(1) + REDACTED, redacted
-    )
+    redacted = redact_community_name_fields(redacted)
     # Per-field only: mask an index that is itself the configured secret.
     community = valid_community_for_redaction()
     if community:
