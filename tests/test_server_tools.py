@@ -99,6 +99,10 @@ def test_tools_registered() -> None:
         "poe_set",
         "port_set_description",
         "save_config",
+        "snmp_view_create",
+        "snmp_community_create",
+        "snmp_community_remove",
+        "snmp_user_remove",
     }
 
 

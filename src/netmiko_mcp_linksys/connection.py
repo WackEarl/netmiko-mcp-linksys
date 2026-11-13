@@ -19,6 +19,7 @@ from typing import Any
 from netmiko import ConnectHandler
 
 from netmiko_mcp_linksys.output import strip_controls as _strip_controls
+from netmiko_mcp_linksys.snmp_cli import redact_community_listing
 from netmiko_mcp_linksys.validation import (
     ValidationError,
     config_output_is_error,
@@ -124,6 +125,39 @@ def session_log_path() -> str | None:
         return None
 
 
+def redact_show_output(command: str, text: str) -> str:
+    """Redact secrets in exec output. Community listings are fully masked."""
+    if re.search(r"(?i)\bshow\s+snmp\s+community\b", command.strip()):
+        return redact_community_listing(text)
+    return redact_secrets(text)
+
+
+def redact_session_log_file() -> None:
+    """Rewrite SWITCH_SESSION_LOG so a community echo cannot remain in clear text.
+
+    Called after the netmiko session is disconnected. Failures are
+    warnings only; they never raise.
+    """
+    raw = (os.environ.get("SWITCH_SESSION_LOG") or "").strip()
+    if not raw:
+        return
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        return
+    try:
+        original = path.read_text(encoding="utf-8", errors="replace")
+        redacted = redact_community_listing(original)
+        if redacted == original:
+            return
+        path.write_text(redacted, encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        warn(
+            f"SWITCH_SESSION_LOG could not be redacted ({exc}).",
+            once_key=f"session-log-redact:{raw}",
+        )
+
+
 def connect_params() -> dict[str, Any]:
     host = (os.environ.get("SWITCH_HOST") or "").strip()
     username = (os.environ.get("SWITCH_USER") or "").strip()
@@ -219,6 +253,7 @@ def session() -> Iterator[Any]:
                     conn.disconnect()
                 except Exception:
                     pass
+            redact_session_log_file()
 
 
 def _prompt_regex(conn: Any) -> re.Pattern[str]:
@@ -362,14 +397,20 @@ def build_description_commands(port: str, text: str | None) -> list[str]:
     ]
 
 
+def send_paged_redacted(conn: Any, command: str) -> str:
+    """send_paged, then redact secrets (and community listings)."""
+    return redact_show_output(command, send_paged(conn, command))
+
+
 def run_show(command: str) -> str:
     with session() as conn:
-        try:
-            return send_paged(conn, command)
-        except ConnectionError:
-            raise
-        except Exception as exc:
-            raise ConnectionError(redact_secrets(str(exc))) from None
+        return send_paged_redacted(conn, command)
+
+
+def run_shows(commands: list[str]) -> dict[str, str]:
+    """Run several exec commands in one session; values are already redacted."""
+    with session() as conn:
+        return {command: send_paged_redacted(conn, command) for command in commands}
 
 
 def _send_config(conn: Any, commands: list[str]) -> str:
@@ -387,7 +428,7 @@ def _send_config(conn: Any, commands: list[str]) -> str:
         raise ConnectionError(
             "Device rejected the configuration sequence:\n" + redact_secrets(text)
         )
-    return text
+    return redact_secrets(text)
 
 
 def run_config_set(commands: list[str]) -> str:
@@ -409,8 +450,31 @@ def run_config_and_readback(commands: list[str], readback: str) -> str:
         return (
             "Configuration sent.\n"
             f"--- {readback} ---\n"
-            f"{state_text}"
+            f"{redact_show_output(readback, state_text)}"
         )
+
+
+def run_config_and_readbacks(commands: list[str], readbacks: list[str]) -> str:
+    """Apply a config set, then run one or more exec read-backs in the same session."""
+    with session() as conn:
+        _send_config(conn, commands)
+        sections: list[str] = ["Configuration sent."]
+        for readback in readbacks:
+            try:
+                state_text = send_paged_redacted(conn, readback)
+            except ConnectionError as exc:
+                raise ConnectionError(
+                    "Configuration was sent, but read-back failed: "
+                    + redact_secrets(str(exc))
+                ) from None
+            sections.append(f"--- {readback} ---\n{state_text}")
+        return "\n".join(sections)
+
+
+def run_in_session(callback: Any) -> Any:
+    """Run ``callback(conn)`` inside a locked session. Output must be redacted by the caller if needed."""
+    with session() as conn:
+        return callback(conn)
 
 
 def run_save() -> str:
@@ -423,4 +487,4 @@ def run_save() -> str:
             raise ConnectionError(redact_secrets(str(exc))) from None
     if config_output_is_error(text, commands=["save"]):
         raise ConnectionError("save failed:\n" + redact_secrets(text))
-    return text
+    return redact_secrets(text)

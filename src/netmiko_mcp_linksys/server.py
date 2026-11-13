@@ -22,25 +22,55 @@ from netmiko_mcp_linksys.connection import (
     READBACK_DESCRIPTION,
     READBACK_INTERFACE,
     READBACK_POE,
+    _send_config,
     build_admin_state_commands,
     build_description_commands,
     build_poe_commands,
     read_timeout,
+    redact_show_output,
     run_config_and_readback,
+    run_config_and_readbacks,
+    run_in_session,
     run_save,
     run_show,
+    send_paged,
     session_log_path,
 )
 from netmiko_mcp_linksys.connection import (
     ConnectionError as SwitchConnectionError,
+)
+from netmiko_mcp_linksys.snmp_cli import (
+    CLI_SOURCE,
+    READBACK_SNMP_ACCESS,
+    READBACK_SNMP_COMMUNITY,
+    READBACK_SNMP_GROUP,
+    READBACK_SNMP_USER,
+    READBACK_SNMP_VIEW,
+    assert_configured_community_ready,
+    build_community_create_commands,
+    build_community_remove_commands,
+    build_user_remove_commands,
+    build_view_create_commands,
+    format_sent_commands,
+    normalize_subtree,
+    parse_snmp_community,
+    parse_snmp_viewtree,
+    resolve_removable_community_name,
+    user_present,
+    view_is_restricted,
 )
 from netmiko_mcp_linksys.validation import (
     ValidationError,
     redact_secrets,
     reject_if_protected,
     reject_unsafe_show_command,
+    validate_community_remove_name,
     validate_description,
     validate_port,
+    validate_snmp_access,
+    validate_snmp_community_secret,
+    validate_snmp_name,
+    validate_user_remove_name,
 )
 
 try:
@@ -55,6 +85,10 @@ mcp = MCPServer(
         "netmiko and netmiko-mcp. Use show for allow-listed read commands. "
         "Configuration tools build fixed CLI sequences; they do not accept "
         "free-form config. There are no VLAN, reboot, or reset tools. "
+        "SNMP write tools (snmp_view_create, snmp_community_create, "
+        "snmp_community_remove, snmp_user_remove) are narrow and must be "
+        "gated by hub unlock, like save_config. The community secret comes "
+        "only from SWITCH_SNMP_COMMUNITY and is redacted as [REDACTED]. "
         "Changes are not saved until save_config is called."
     ),
     version=_PKG_VERSION,
@@ -488,6 +522,270 @@ def port_set_description(port: str, text: str | None = None) -> str:
     except SwitchConnectionError as exc:
         return _fail("port_set_description", params, f"Error: {exc}", allowed=True)
     return _ok("port_set_description", params, output)
+
+
+
+def _snmp_exec(conn: Any, command: str) -> str:
+    """Exec a show command; return raw device text. Caller must redact before returning."""
+    return send_paged(conn, command)
+
+
+def _snmp_syntax_note() -> str:
+    return (
+        "CLI syntax source: " + CLI_SOURCE + " "
+        "These commands are not live-confirmed; have Redy verify them "
+        "before relying on the result."
+    )
+
+
+def _snmp_fail(tool: str, params: dict[str, Any], exc: BaseException, *, allowed: bool) -> str:
+    prefix = "Rejected: " if isinstance(exc, ValidationError) and not allowed else "Error: "
+    # ValidationError is already written without the secret; still redact.
+    return _fail(tool, params, prefix + str(exc), allowed=allowed)
+
+
+@mcp.tool()
+def snmp_view_create(view_name: str, subtree: str) -> str:
+    """Add one allow-listed included subtree to an SNMP view. Does not save.
+
+    Gate this in the hub with unlock. subtree must be an OID or alias from
+    the fixed allowlist (interfaces / ifmib / power-ethernet). The CLI
+    syntax is not live-confirmed; see the README.
+    """
+    params = {"view_name": view_name, "subtree": subtree}
+    try:
+        view_name = validate_snmp_name(view_name, what="view name")
+        oid = normalize_subtree(subtree)
+        commands = build_view_create_commands(view_name, oid)
+        output = run_config_and_readbacks(commands, [READBACK_SNMP_VIEW])
+        views = parse_snmp_viewtree(output)
+        present = any(
+            item.name.lower() == view_name.lower() and item.oid == oid
+            for item in views
+        )
+        if present:
+            note = (
+                f"Read-back check: view {view_name} includes {oid}."
+            )
+        else:
+            note = (
+                f"Read-back check: could not verify that view {view_name} "
+                f"includes {oid}. Confirm show snmp viewtree live; the "
+                "parser assumes ISS key: value blocks."
+            )
+        body = (
+            format_sent_commands(commands)
+            + "\n\n"
+            + output
+            + "\n\n"
+            + note
+            + "\n"
+            + _snmp_syntax_note()
+        )
+    except ValidationError as exc:
+        return _snmp_fail("snmp_view_create", params, exc, allowed=False)
+    except SwitchConnectionError as exc:
+        return _snmp_fail("snmp_view_create", params, exc, allowed=True)
+    return _ok("snmp_view_create", params, body)
+
+
+def _precheck_view_for_community(conn: Any, view_name: str) -> None:
+    views_text = _snmp_exec(conn, READBACK_SNMP_VIEW)
+    views = parse_snmp_viewtree(views_text)
+    if not views:
+        raise ValidationError(
+            "Could not parse show snmp viewtree (unknown table layout, or "
+            "the view list is empty). Refusing to create a community until "
+            "the view can be verified. Confirm the output format live."
+        )
+    names = {item.name.lower() for item in views}
+    if view_name.lower() not in names:
+        raise ValidationError(
+            f"View {view_name!r} was not found in show snmp viewtree. "
+            "Create it with snmp_view_create first."
+        )
+    ok, note = view_is_restricted(views, view_name)
+    if not ok:
+        raise ValidationError(
+            note + ". Refusing to bind a community to a view that is not "
+            "restricted to the OID allowlist."
+        )
+
+
+@mcp.tool()
+def snmp_community_create(view_name: str, access: str) -> str:
+    """Create a v2c community from SWITCH_SNMP_COMMUNITY, bound to a view.
+
+    access is 'ro' or 'rw'. The secret is never a tool argument and is
+    redacted as [REDACTED] in all output. Does not save. Gate with hub unlock.
+    The CLI syntax is not live-confirmed; see the README.
+    """
+    params = {"view_name": view_name, "access": access}
+    try:
+        view_name = validate_snmp_name(view_name, what="view name")
+        access = validate_snmp_access(access)
+        community = validate_snmp_community_secret()
+        commands = build_community_create_commands(view_name, access, community)
+
+        def _run(conn: Any) -> str:
+            _precheck_view_for_community(conn, view_name)
+            _send_config(conn, commands)
+            community_out = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
+            group_out = _snmp_exec(conn, READBACK_SNMP_GROUP)
+            access_out = _snmp_exec(conn, READBACK_SNMP_ACCESS)
+            view_out = _snmp_exec(conn, READBACK_SNMP_VIEW)
+            status = assert_configured_community_ready(
+                community_output=community_out,
+                group_output=group_out,
+                access_output=access_out,
+                view_output=view_out,
+                community=community,
+            )
+            return (
+                format_sent_commands(commands)
+                + "\n\nConfiguration sent.\n"
+                + f"--- {READBACK_SNMP_COMMUNITY} ---\n"
+                + redact_show_output(READBACK_SNMP_COMMUNITY, community_out)
+                + "\n"
+                + f"--- {READBACK_SNMP_GROUP} ---\n"
+                + redact_show_output(READBACK_SNMP_GROUP, group_out)
+                + "\n"
+                + f"--- {READBACK_SNMP_ACCESS} ---\n"
+                + redact_show_output(READBACK_SNMP_ACCESS, access_out)
+                + "\n"
+                + f"--- {READBACK_SNMP_VIEW} ---\n"
+                + redact_show_output(READBACK_SNMP_VIEW, view_out)
+                + "\n\n"
+                + "Read-back check: "
+                + status
+                + "\n"
+                + _snmp_syntax_note()
+            )
+
+        body = run_in_session(_run)
+    except ValidationError as exc:
+        return _snmp_fail("snmp_community_create", params, exc, allowed=False)
+    except SwitchConnectionError as exc:
+        return _snmp_fail("snmp_community_create", params, exc, allowed=True)
+    return _ok("snmp_community_create", params, redact_secrets(body))
+
+
+@mcp.tool()
+def snmp_community_remove(name: str) -> str:
+    """Remove an allow-listed default community (public or private).
+
+    Refuses unless the configured SWITCH_SNMP_COMMUNITY community is
+    present and mapped to a restricted allow-listed view. Never removes
+    the configured community itself. Does not save. Gate with hub unlock.
+    """
+    params = {"name": name}
+    try:
+        community = validate_snmp_community_secret()
+        requested = validate_community_remove_name(name, community)
+
+        def _run(conn: Any) -> str:
+            community_out = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
+            group_out = _snmp_exec(conn, READBACK_SNMP_GROUP)
+            access_out = _snmp_exec(conn, READBACK_SNMP_ACCESS)
+            view_out = _snmp_exec(conn, READBACK_SNMP_VIEW)
+            status = assert_configured_community_ready(
+                community_output=community_out,
+                group_output=group_out,
+                access_output=access_out,
+                view_output=view_out,
+                community=community,
+            )
+            entries = parse_snmp_community(community_out)
+            exact = resolve_removable_community_name(requested, entries, community)
+            commands = build_community_remove_commands(exact)
+            _send_config(conn, commands)
+            after = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
+            still = any(
+                (item.name.lower() == exact.lower())
+                or (item.index.lower() == exact.lower())
+                for item in parse_snmp_community(after)
+            )
+            if still:
+                note = (
+                    f"Read-back check: {exact} is still present in "
+                    "show snmp community after the no-command."
+                )
+            else:
+                note = (
+                    f"Read-back check: {exact} is no longer present in "
+                    "show snmp community. "
+                    + status
+                )
+            return (
+                format_sent_commands(commands)
+                + "\n\n"
+                + status
+                + "\n\nConfiguration sent.\n"
+                + f"--- {READBACK_SNMP_COMMUNITY} ---\n"
+                + redact_show_output(READBACK_SNMP_COMMUNITY, after)
+                + "\n\n"
+                + note
+                + "\n"
+                + _snmp_syntax_note()
+            )
+
+        body = run_in_session(_run)
+    except ValidationError as exc:
+        return _snmp_fail("snmp_community_remove", params, exc, allowed=False)
+    except SwitchConnectionError as exc:
+        return _snmp_fail("snmp_community_remove", params, exc, allowed=True)
+    return _ok("snmp_community_remove", params, redact_secrets(body))
+
+
+@mcp.tool()
+def snmp_user_remove(name: str) -> str:
+    """Remove an allow-listed SNMP user (noAuthUser). Does not save.
+
+    Gate this in the hub with unlock. The CLI syntax is not live-confirmed.
+    """
+    params = {"name": name}
+    try:
+        name = validate_user_remove_name(name)
+        commands = build_user_remove_commands(name)
+
+        def _run(conn: Any) -> str:
+            before = _snmp_exec(conn, READBACK_SNMP_USER)
+            if not user_present(before, name):
+                return (
+                    f"SNMP user {name} was not present in show snmp user; "
+                    "no configuration was sent.\n"
+                    f"--- {READBACK_SNMP_USER} ---\n"
+                    + redact_show_output(READBACK_SNMP_USER, before)
+                    + "\n"
+                    + _snmp_syntax_note()
+                )
+            _send_config(conn, commands)
+            after = _snmp_exec(conn, READBACK_SNMP_USER)
+            if user_present(after, name):
+                note = (
+                    f"Read-back check: {name} is still present in show snmp user."
+                )
+            else:
+                note = (
+                    f"Read-back check: {name} is no longer present in show snmp user."
+                )
+            return (
+                format_sent_commands(commands)
+                + "\n\nConfiguration sent.\n"
+                + f"--- {READBACK_SNMP_USER} ---\n"
+                + redact_show_output(READBACK_SNMP_USER, after)
+                + "\n\n"
+                + note
+                + "\n"
+                + _snmp_syntax_note()
+            )
+
+        body = run_in_session(_run)
+    except ValidationError as exc:
+        return _snmp_fail("snmp_user_remove", params, exc, allowed=False)
+    except SwitchConnectionError as exc:
+        return _snmp_fail("snmp_user_remove", params, exc, allowed=True)
+    return _ok("snmp_user_remove", params, redact_secrets(body))
 
 
 @mcp.tool()
