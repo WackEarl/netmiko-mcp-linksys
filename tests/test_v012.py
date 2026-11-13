@@ -108,11 +108,93 @@ def test_readback_note_variants() -> None:
     assert "without quotes" in description_readback_note(table, "0/7", "Repeater EG")
     quoted = table.replace("Repeater EG", '"Repeater EG"')
     assert "WITH quotes" in description_readback_note(quoted, "0/7", "Repeater EG")
-    assert "no row for 0/2" in description_readback_note(table, "0/2", "Repeater EG")
+    missing = description_readback_note(table, "0/2", "Repeater EG")
+    assert "could not verify (port row not found)" in missing
+    assert "Interface" in missing
+    assert "expected" not in missing
     assert "expected" in description_readback_note(table, "0/7", "nas uplink")
     assert "is empty" in description_readback_note(table, "0/1", "Repeater EG")
     assert "description is empty." in description_readback_note(table, "0/1", None)
     assert "still" in description_readback_note(table, "0/7", None)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        "Gi0/7  Up  Up  Repeater EG",
+        "gi7  Up  Up  Repeater EG",
+        "gi1/0/7  Up  Up  Repeater EG",
+        "GigabitEthernet0/7  Up  Up  Repeater EG",
+    ],
+)
+def test_readback_without_header_ends_with_description(row: str) -> None:
+    note = description_readback_note(row, "0/7", "Repeater EG")
+    assert "without quotes" in note
+    assert "could not verify" not in note
+    assert "expected" not in note
+
+
+def test_readback_without_header_unknown_layout_includes_raw_row() -> None:
+    row = "Gi0/7  Up  Up  something else"
+    note = description_readback_note(row, "0/7", "Repeater EG")
+    assert "could not verify (unknown table layout)" in note
+    assert "Gi0/7  Up  Up  something else" in note
+    assert "expected" not in note
+
+
+def test_readback_without_header_collapses_whitespace() -> None:
+    row = "Gi0/7   Up   Up   Repeater    EG"
+    assert "without quotes" in description_readback_note(row, "0/7", "Repeater EG")
+
+
+def test_readback_truncated_description_is_ok() -> None:
+    table = "\n".join(
+        [
+            ASSUMED_DESCRIPTION_HEADER,
+            _desc_row("0/7", "up", "up", "Repeater EG Wohnzimme"),
+        ]
+    )
+    note = description_readback_note(table, "0/7", "Repeater EG Wohnzimmer")
+    assert "probably truncated by the switch table, ok" in note
+    assert "Repeater EG Wohnzimme" in note
+    assert "expected" not in note
+
+
+def test_readback_short_prefix_ok_when_it_fills_column_width() -> None:
+    # No trailing padding: the parsed field runs to the end of the line.
+    header = ASSUMED_DESCRIPTION_HEADER
+    col = header.find("Description")
+    row = ("Gi0/7".ljust(col) + "Repeat")
+    table = header + "\n" + row
+    note = description_readback_note(table, "0/7", "Repeater EG")
+    assert "probably truncated by the switch table, ok" in note
+
+
+def test_short_port_form_does_not_match_three_level_row() -> None:
+    # gi1/0/7 is port 0/7, not a short gi1 (port 0/1).
+    row = "gi1/0/7  Up  Up  Repeater EG"
+    assert "without quotes" in description_readback_note(row, "0/7", "Repeater EG")
+    note = description_readback_note(row, "0/1", "Repeater EG")
+    assert "could not verify (port row not found)" in note
+    assert "expected" not in note
+
+
+def test_readback_port_row_not_found_includes_preview_not_mismatch() -> None:
+    table = "Header junk\nGi0/10  Up  Up  Repeater EG\n"
+    note = description_readback_note(table, "0/1", "Repeater EG")
+    assert "could not verify (port row not found)" in note
+    assert "Gi0/10" in note
+    assert "expected" not in note
+
+
+def test_readback_header_collapses_whitespace_in_comparison() -> None:
+    table = "\n".join(
+        [
+            ASSUMED_DESCRIPTION_HEADER,
+            _desc_row("0/7", "up", "up", "Repeater  EG"),
+        ]
+    )
+    assert "without quotes" in description_readback_note(table, "0/7", "Repeater EG")
 
 
 def _rows(start: int, stop: int) -> str:

@@ -24,11 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `port_set_description` now reads back via `show interfaces description`
   and parses the row for the port (the previous
   `show interfaces gigabitethernet 0/N` read-back does not show
-  descriptions on the LGS). The informational note reports whether the
-  parsed text matches, is quoted, is empty, is missing, or differs.
-  The table layout is assumed (Cisco/ISS-style fixed-width
-  `Description` column, `Gi0/N` rows); the v0.1.2 live retest confirmed
-  only that the command shows e.g. `Repeater EG` without quotes
+  descriptions on the LGS). Port rows `Gi0/7`, `gi7`, `gi1/0/7`, and
+  `GigabitEthernet0/7` are recognised (and `0/1` does not match `0/10`).
+  With a `Description`/`Name` header, the note compares the column
+  (whitespace collapsed); a non-empty prefix of the expected text that
+  fills the column or is at least 8 characters is reported as probably
+  truncated, not as a mismatch. Without a recognised header, a row that
+  ends with the expected text is verified; otherwise the note says
+  `could not verify (unknown table layout)` and includes the raw row.
+  A missing row is `could not verify (port row not found)` plus a short
+  preview, never a mismatch. Leading or trailing spaces in the
+  description are rejected
   ([#2](https://github.com/WackEarl/netmiko-mcp-linksys/issues/2)).
 - Blank lines immediately before a page break (as well as after it) are
   dropped, so the two leftover blank lines seen at page breaks in the

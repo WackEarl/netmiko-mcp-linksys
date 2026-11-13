@@ -113,14 +113,15 @@ Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 | `port_overview()` | Read-only bundle of `show system information`, `show vlan`, `show power inline`, and `show interfaces`, each passed through the same command filter. | n/a |
 | `port_set_admin_state(port, enabled)` | `interface gigabitethernet 0/N` then `no shutdown` / `shutdown`. | no |
 | `poe_set(port, enabled)` | `interface gigabitethernet 0/N` then `power inline enable` / `power inline disable`. PoE ports: `0/1`–`0/24`. | no |
-| `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back of `show interfaces description` for that port (found without quotes / found with quotes / empty / missing row / unexpected text). | no |
+| `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back of `show interfaces description` for that port (verified, quoted, empty, probably truncated, or could not verify). | no |
 | `save_config()` | Privileged exec `save` only. Gate this in the hub with `unlock`. | yes |
 
 There are no VLAN, reboot, or reset tools.
 
 Port format: `0/1` … `0/28` (no leading zeros). PoE: `0/1` … `0/24`.
-Descriptions: 1–32 characters from `[A-Za-z0-9 ._-]`. Quotes are not allowed
-in the input, so the wrapper's own quoting cannot be broken out of.
+Descriptions: 1–32 characters from `[A-Za-z0-9 ._-]`, with no leading or
+trailing spaces. Quotes are not allowed in the input, so the wrapper's
+own quoting cannot be broken out of.
 
 ## Security model
 

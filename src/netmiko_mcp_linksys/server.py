@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -223,46 +224,96 @@ def poe_set(port: str, enabled: bool) -> str:
     return _ok("poe_set", params, output)
 
 
+def _collapse_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+_MIN_TRUNCATION_PREFIX = 8
+_PREVIEW_LINES = 4
+
+# Port 0/7 also appears as gi7, gi1/0/7, Gi0/7, or GigabitEthernet0/7.
+# Longer patterns come first; a following alnum char rejects gi0/1 vs gi0/10.
+_PORT_TOKEN_PATTERNS = (
+    r"gigabitethernet\s*{port}",
+    r"gigabitethernet\s*\d+/\d+/{number}",
+    r"gigabitethernet\s*{number}",
+    r"gi\s*{port}",
+    r"gi\s*\d+/\d+/{number}",
+    r"gi\s*{number}",
+)
+
+
 def _port_token_end(line: str, port: str) -> int | None:
-    """If line starts with a Gi0/N-style name for port, return the end index."""
+    """If line starts with a recognised name for port, return the end index."""
     stripped = line.lstrip()
     pad = len(line) - len(stripped)
     lower = stripped.lower()
-    for token in (
-        f"gi{port}",
-        f"gi {port}",
-        f"gigabitethernet{port}",
-        f"gigabitethernet {port}",
-    ):
-        if lower.startswith(token) and (
-            len(stripped) == len(token) or not stripped[len(token)].isalnum()
+    number = port.split("/")[-1]
+    values = {"port": re.escape(port), "number": re.escape(number)}
+    for pattern in _PORT_TOKEN_PATTERNS:
+        match = re.match(pattern.format(**values), lower)
+        if match is None:
+            continue
+        end = match.end()
+        # Reject a following alnum (gi0/1 vs gi0/10) or '/' (gi1 vs gi1/0/7).
+        if end == len(stripped) or not (
+            stripped[end].isalnum() or stripped[end] == "/"
         ):
-            return pad + len(token)
+            return pad + end
     return None
 
 
 def _is_interface_row(line: str) -> bool:
-    return bool(re.match(r"(?i)^\s*(?:gi|gigabitethernet)\s*0/\d+", line))
+    return bool(
+        re.match(
+            r"(?i)^\s*(?:gi|gigabitethernet)\s*\d+(?:/\d+){0,2}(?:\s|$|[^0-9a-z])",
+            line,
+        )
+    )
 
 
-def parse_interface_description(output: str, port: str) -> str | None:
-    """Return the description for port (e.g. '0/7') from a description table.
+def _ends_with_text(row: str, text: str) -> bool:
+    haystack = _collapse_ws(row)
+    needle = _collapse_ws(text)
+    if not needle:
+        return False
+    return haystack == needle or haystack.endswith(" " + needle)
 
-    ``None`` means no row for that port was found; an empty string means the
-    row was present with no description.
 
-    The exact LGS328PC table layout has not been captured in a fixture. The
-    live retest of v0.1.2 only confirmed that ``show interfaces description``
-    shows the text (e.g. ``Repeater EG``, without quotes). This parser
-    assumes a Cisco/ISS-style fixed-width table with a header that contains
-    ``Description`` (or ``Name``) and data rows starting with ``Gi0/N``.
-    The description is the slice of the row starting at the header column.
-    Confirm the layout on the next live test.
+def _is_truncated(parsed: str, expected: str, *, fills_width: bool) -> bool:
+    parsed_n = _collapse_ws(parsed)
+    expected_n = _collapse_ws(expected)
+    if not parsed_n or parsed_n == expected_n or not expected_n.startswith(parsed_n):
+        return False
+    return fills_width or len(parsed_n) >= _MIN_TRUNCATION_PREFIX
+
+
+def _output_preview(body: str) -> str:
+    lines = [line.rstrip() for line in body.splitlines() if line.strip()]
+    return "\n".join(lines[:_PREVIEW_LINES]) or "(empty)"
+
+
+@dataclass(frozen=True)
+class DescriptionRow:
+    raw: str
+    header_col: int | None
+    parsed: str | None
+    fills_width: bool
+
+
+def find_description_row(
+    output: str, port: str
+) -> tuple[DescriptionRow | None, str]:
+    """Locate the port row in a show interfaces description table.
+
+    The second item is a short preview of the table body, for notes when
+    the row cannot be found.
     """
     body = output.split(" ---\n", 1)[-1]
+    preview = _output_preview(body)
     header_col: int | None = None
     for line in body.splitlines():
-        raw = line.rstrip()
+        raw = line.rstrip("\r")
         if not raw.strip():
             continue
         if header_col is None and not _is_interface_row(raw):
@@ -272,13 +323,42 @@ def parse_interface_description(output: str, port: str) -> str | None:
             if match:
                 header_col = match.start()
                 continue
-        end = _port_token_end(raw, port)
-        if end is None:
+        if _port_token_end(raw, port) is None:
             continue
         if header_col is not None:
-            return raw[header_col:].strip() if len(raw) > header_col else ""
-        return raw[end:].strip()
-    return None
+            field = raw[header_col:] if len(raw) > header_col else ""
+            return (
+                DescriptionRow(
+                    raw=raw.rstrip(),
+                    header_col=header_col,
+                    parsed=field.strip(),
+                    fills_width=bool(field) and field == field.rstrip(),
+                ),
+                preview,
+            )
+        return (
+            DescriptionRow(
+                raw=raw.rstrip(),
+                header_col=None,
+                parsed=None,
+                fills_width=False,
+            ),
+            preview,
+        )
+    return None, preview
+
+
+def parse_interface_description(output: str, port: str) -> str | None:
+    """Return the header-column description for port, or None.
+
+    ``None`` means the row was not found or the table header was not
+    recognised (no Description/Name column). An empty string means the
+    row was present with no description.
+    """
+    row, _ = find_description_row(output, port)
+    if row is None or row.header_col is None:
+        return None
+    return row.parsed
 
 
 def description_readback_note(readback: str, port: str, text: str | None) -> str:
@@ -286,24 +366,59 @@ def description_readback_note(readback: str, port: str, text: str | None) -> str
 
     The command is sent quoted; the switch should store and show the text
     without quotes. A quoted match means the quotes were stored literally.
+    Comparisons collapse whitespace. Without a recognised header, a row
+    that ends with the expected text is treated as verified; otherwise
+    the note says the layout could not be verified. A missing row is
+    never reported as a mismatch.
     """
-    parsed = parse_interface_description(readback, port)
-    if parsed is None:
+    row, preview = find_description_row(readback, port)
+    if row is None:
         return (
-            f"Read-back check: no row for {port} in show interfaces description."
+            "Read-back check: could not verify (port row not found). "
+            f"Output starts with:\n{preview}"
         )
     if text is None:
-        if not parsed:
+        if row.header_col is None:
+            end = _port_token_end(row.raw, port)
+            remainder = _collapse_ws(row.raw[end:] if end is not None else row.raw)
+            if not remainder:
+                return "Read-back check: description is empty."
+            return (
+                "Read-back check: could not verify (unknown table layout): "
+                f"{row.raw!r}"
+            )
+        if not row.parsed:
             return "Read-back check: description is empty."
-        return f"Read-back check: description is still {parsed!r}."
-    if parsed == f'"{text}"':
+        return f"Read-back check: description is still {row.parsed!r}."
+
+    if row.header_col is None:
+        if _ends_with_text(row.raw, f'"{text}"'):
+            return (
+                "Read-back check: description appears WITH quotes; the switch "
+                "stored the quotes literally."
+            )
+        if _ends_with_text(row.raw, text):
+            return "Read-back check: description found in read-back (without quotes)."
+        return (
+            "Read-back check: could not verify (unknown table layout): "
+            f"{row.raw!r}"
+        )
+
+    parsed = row.parsed or ""
+    parsed_n = _collapse_ws(parsed)
+    if parsed_n == _collapse_ws(f'"{text}"'):
         return (
             "Read-back check: description appears WITH quotes; the switch "
             "stored the quotes literally."
         )
-    if parsed == text:
+    if parsed_n == _collapse_ws(text):
         return "Read-back check: description found in read-back (without quotes)."
-    if not parsed:
+    if _is_truncated(parsed, text, fills_width=row.fills_width):
+        return (
+            "Read-back check: probably truncated by the switch table, ok "
+            f"({parsed!r})."
+        )
+    if not parsed_n:
         return "Read-back check: description is empty in the read-back output."
     return f"Read-back check: description is {parsed!r}, expected {text!r}."
 

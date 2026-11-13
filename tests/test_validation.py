@@ -65,6 +65,12 @@ def test_invalid_descriptions(text: str) -> None:
         validate_description(text)
 
 
+@pytest.mark.parametrize("text", ["x ", " x", " x ", "x  "])
+def test_validate_description_rejects_leading_or_trailing_spaces(text: str) -> None:
+    with pytest.raises(ValidationError, match="Leading or trailing spaces"):
+        validate_description(text)
+
+
 @pytest.mark.parametrize(
     "command",
     [

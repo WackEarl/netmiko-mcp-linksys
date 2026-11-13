@@ -60,7 +60,7 @@ def test_description_none_clears() -> None:
     ) as run:
         result = port_set_description("0/1", None)
     assert result.startswith("cleared")
-    assert "no row for 0/1 in show interfaces description" in result
+    assert "could not verify (port row not found)" in result
     commands, readback = run.call_args.args
     assert commands == ["interface gigabitethernet 0/1", "no description"]
     assert readback == "show interfaces description"
