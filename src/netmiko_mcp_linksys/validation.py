@@ -30,12 +30,141 @@ class ValidationError(ValueError):
     """User-facing validation failure. Safe to return as a tool result."""
 
 
+REDACTED_COMMUNITY = "[REDACTED]"
+
+# View / group / security identifiers. Capped at 28 so derived names
+# "{view}_grp" / "{view}_sec" stay within the CLI's 32-character limit.
+SNMP_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,27}$")
+SNMP_COMMUNITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$")
+SNMP_COMMUNITY_MIN = 8
+SNMP_COMMUNITY_MAX = 64
+DEFAULT_SNMP_COMMUNITIES = frozenset({"public", "private"})
+SNMP_REMOVE_COMMUNITY_ALLOWLIST = frozenset({"public", "private"})
+SNMP_REMOVE_USER_ALLOWLIST = frozenset({"noAuthUser"})
+SNMP_RESERVED_NAMES = frozenset(
+    {
+        "iso",
+        "restricted",
+        "default",
+        "defaultsuper",
+        "initial",
+        "public",
+        "private",
+        "noauthuser",
+        "templatemd5",
+        "templatesha",
+        "netman",
+        "none",
+        "all",
+        "snmp",
+    }
+)
+
+
 def redact_secrets(text: str) -> str:
-    """Strip the switch password from any text that might be shown or logged."""
+    """Strip the switch password and SNMP community from shown or logged text.
+
+    The community becomes ``[REDACTED]``; the SSH password stays ``***``
+    (existing behaviour). The community is replaced first so a password
+    that happened to be a substring of it cannot leak a suffix.
+    """
+    community = os.environ.get("SWITCH_SNMP_COMMUNITY") or ""
+    if community and community in text:
+        text = text.replace(community, REDACTED_COMMUNITY)
     password = os.environ.get("SWITCH_PASSWORD") or ""
     if password and password in text:
         text = text.replace(password, "***")
     return text
+
+
+def validate_snmp_name(name: str, *, what: str = "name") -> str:
+    """Strict identifier for view / group / security names (not secrets)."""
+    if not isinstance(name, str) or not SNMP_NAME_RE.fullmatch(name):
+        raise ValidationError(
+            f"Invalid SNMP {what} {name!r}. Use 1..28 characters matching "
+            "[A-Za-z][A-Za-z0-9_-]* (no dots, spaces, or quotes)."
+        )
+    if name.lower() in SNMP_RESERVED_NAMES:
+        raise ValidationError(
+            f"SNMP {what} {name!r} is reserved and cannot be used."
+        )
+    return name
+
+
+def validate_snmp_access(access: str) -> str:
+    if not isinstance(access, str) or access.lower() not in {"ro", "rw"}:
+        raise ValidationError("access must be 'ro' or 'rw'.")
+    return access.lower()
+
+
+def validate_snmp_community_secret(raw: str | None = None) -> str:
+    """Validate SWITCH_SNMP_COMMUNITY. Never echo the value in errors."""
+    if raw is None:
+        if "SWITCH_SNMP_COMMUNITY" not in os.environ:
+            raise ValidationError(
+                "SWITCH_SNMP_COMMUNITY is not set. Set it to a non-default "
+                "community string (8..64 characters from [A-Za-z0-9._-]). "
+                "The value is never accepted as a tool argument."
+            )
+        raw = os.environ["SWITCH_SNMP_COMMUNITY"]
+    if not isinstance(raw, str) or not raw:
+        raise ValidationError(
+            "SWITCH_SNMP_COMMUNITY is empty. Set it to a non-default "
+            "community string (8..64 characters from [A-Za-z0-9._-]). "
+            "The value is not shown."
+        )
+    # Default names first, even when they are shorter than the minimum,
+    # so the error is specific and still does not echo the value.
+    if raw.lower() in DEFAULT_SNMP_COMMUNITIES:
+        raise ValidationError(
+            "SWITCH_SNMP_COMMUNITY must not be a default community "
+            "(public or private)."
+        )
+    if raw != raw.strip() or not SNMP_COMMUNITY_RE.fullmatch(raw):
+        raise ValidationError(
+            "SWITCH_SNMP_COMMUNITY is invalid. Use "
+            f"{SNMP_COMMUNITY_MIN}..{SNMP_COMMUNITY_MAX} characters from "
+            "[A-Za-z0-9._-], starting with alphanumeric, with no spaces "
+            "or quotes. The value is not shown."
+        )
+    return raw
+
+
+def validate_community_remove_name(name: str, configured: str) -> str:
+    """Allow only public/private. Never allow the configured community."""
+    if not isinstance(name, str) or not name:
+        raise ValidationError(
+            "Community name must be one of the removal allowlist: "
+            + ", ".join(sorted(SNMP_REMOVE_COMMUNITY_ALLOWLIST))
+            + "."
+        )
+    if name == configured or name.lower() == configured.lower():
+        raise ValidationError(
+            "Refusing to remove the configured SWITCH_SNMP_COMMUNITY community."
+        )
+    for allowed in SNMP_REMOVE_COMMUNITY_ALLOWLIST:
+        if name == allowed or name.lower() == allowed.lower():
+            return allowed
+    raise ValidationError(
+        f"Community {name!r} is not on the removal allowlist "
+        f"({', '.join(sorted(SNMP_REMOVE_COMMUNITY_ALLOWLIST))})."
+    )
+
+
+def validate_user_remove_name(name: str) -> str:
+    if not isinstance(name, str) or not name:
+        raise ValidationError(
+            "User name must be one of the removal allowlist: "
+            + ", ".join(sorted(SNMP_REMOVE_USER_ALLOWLIST))
+            + "."
+        )
+    for allowed in SNMP_REMOVE_USER_ALLOWLIST:
+        if name == allowed or name.lower() == allowed.lower():
+            return allowed
+    raise ValidationError(
+        f"SNMP user {name!r} is not on the removal allowlist "
+        f"({', '.join(sorted(SNMP_REMOVE_USER_ALLOWLIST))})."
+    )
 
 
 def parse_protected_ports(raw: str | None = None) -> set[str]:

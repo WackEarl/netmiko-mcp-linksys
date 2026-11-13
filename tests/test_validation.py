@@ -81,6 +81,11 @@ def test_validate_description_rejects_leading_or_trailing_spaces(text: str) -> N
         "show interfaces",
         "show interfaces gigabitethernet 0/1",
         "show interfaces description",
+        "show snmp community",
+        "show snmp viewtree",
+        "show snmp group",
+        "show snmp group access",
+        "show snmp user",
     ],
 )
 def test_show_allow_list(command: str, reset_command_file: None, monkeypatch: pytest.MonkeyPatch) -> None:

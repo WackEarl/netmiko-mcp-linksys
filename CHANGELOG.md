@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Narrow, unlock-gated SNMP tools to create an allow-listed IF-MIB view,
+  bind a non-default v2c community from `SWITCH_SNMP_COMMUNITY` (never a
+  tool argument; redacted as `[REDACTED]`), remove only `public`/`private`
+  after the new community is verified with a restricted view, and remove
+  only `noAuthUser`. POWER-ETHERNET-MIB (`1.3.6.1.2.1.105`) is an optional
+  allow-listed subtree for PoE. Command templates live in `snmp_cli.py`
+  and follow the Linksys LGSXXX CLI manual; they are **not live-confirmed**
+  ([#7](https://github.com/WackEarl/netmiko-mcp-linksys/issues/7)).
+
 ## [0.1.3] - 2026-11-13
 
 Fixes from Cody's architecture review and the remaining nits from the

@@ -41,10 +41,23 @@ allowed_commands:
   - show http server status
   - show lbd state
   - show lbd port state
+  # SNMP read-back. show snmp community is redacted by the wrapper.
+  # The documented view command is show snmp viewtree (Linksys CLI
+  # manual); show snmp view is allow-listed only as an unconfirmed alias.
+  - show snmp community
+  - show snmp viewtree
+  - show snmp view
+  - show snmp group
+  - show snmp group access
+  - show snmp user
 denied_commands:
   # Active tests / secrets / config dumps
   - show interface cable-diag*
-  - show snmp*
+  # Broader SNMP dumps stay denied (deny wins). Do not add show snmp*.
+  - show snmp engineid*
+  - show snmp engineID*
+  - show snmp target*
+  - show snmp notif*
   - show radius*
   - show running-config*
   - show current*
