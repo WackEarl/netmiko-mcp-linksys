@@ -22,11 +22,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from itertools import pairwise
 
 from netmiko_mcp_linksys.validation import (
     ValidationError,
-    parse_protected_ifindexes,
-    parse_protected_poe_indexes,
     redact_secrets,
     valid_community_for_redaction,
 )
@@ -74,13 +73,15 @@ from netmiko_mcp_linksys.validation import (
 # communities / the noAuthUser user, and whether POWER-ETHERNET-MIB
 # 1.3.6.1.2.1.105 is implemented on the LGS328PC.
 #
-# UNCONFIRMED: the LGS328PC port -> ifIndex mapping (hence the explicit
-# SWITCH_SNMP_PROTECTED_IFINDEXES), the port -> pethPsePortTable
-# <group>.<port> mapping (hence SWITCH_SNMP_PROTECTED_POE_INDEXES),
-# whether an instance OID such as 1.3.6.1.2.1.2.2.1.7.<ifIndex> or
-# 1.3.6.1.2.1.105.1.1.1.3.<group>.<port> is accepted as an excluded subtree
-# without a mask, and how show snmp viewtree prints the view type and
-# the mask (the parser accepts only empty or all-ones masks).
+# UNCONFIRMED: whether a column OID such as 1.3.6.1.2.1.105.1.1.1.3 is
+# accepted as a view subtree without a mask, and how show snmp viewtree
+# prints the mask for OIDs longer than 1.
+#
+# READ-ONLY CHECK (Redy, 2026-11-13): show snmp viewtree prints key : value
+# blocks such as "Subtree OID  : 1" / "Subtree Mask : 1" /
+# "View Type    : Included" (no leading dot, no "iso.", with a mask); the
+# views on the switch are "iso" and "restricted". mask_is_exact reads such
+# masks per RFC 3415 (bits beyond the OID length do not matter).
 
 CLI_SOURCE = (
     "Linksys LGSXXX CLI User Manual, MAN_LGSXXX_LNKPG-00878_Rev_A00.pdf, "
@@ -131,11 +132,10 @@ POE_ADMIN_ENABLE_OID = "1.3.6.1.2.1.105.1.1.1.3"
 
 # The only columns a *write* view may include (Task 48, Redy's plan
 # approved by Roland): port admin state, port description, PoE on/off.
-# Whole MIB subtrees stay read-view only. Every write view also excludes
-# ifAdminStatus.<ifIndex> of the protected ports, and a write view with
-# pethPsePortAdminEnable also excludes pethPsePortAdminEnable.<group>.<port>
-# of the protected PoE ports (0/10 powers the Unraid server through a PoE
-# splitter; 0/24 is the uplink).
+# Whole MIB subtrees stay read-view only. There are no per-port
+# exclusions (Roland, 2026-11-13): the protected ports (SWITCH_PROTECTED_PORTS)
+# are only refused by this server's tools; anyone with the write
+# community can set these columns for every port, protected ones included.
 WRITE_ALLOWED_SUBTREES: dict[str, str] = {
     IF_ADMIN_STATUS_OID: "ifAdminStatus",
     IF_ALIAS_OID: "ifAlias",
@@ -215,26 +215,6 @@ def build_view_create_commands(view_name: str, oid: str) -> list[str]:
     return [f"snmp view {view_name} {oid} included"]
 
 
-def _oid_key(oid: str) -> list[int]:
-    return [int(part) for part in oid.split(".")]
-
-
-def protected_admin_status_oids(ifindexes: dict[str, str]) -> list[str]:
-    """ifAdminStatus.<ifIndex> OIDs to exclude from every write view."""
-    return sorted(
-        (f"{IF_ADMIN_STATUS_OID}.{ifindex}" for ifindex in ifindexes.values()),
-        key=_oid_key,
-    )
-
-
-def protected_poe_admin_oids(poe_indexes: dict[str, str]) -> list[str]:
-    """pethPsePortAdminEnable.<group>.<port> OIDs to exclude from PoE write views."""
-    return sorted(
-        (f"{POE_ADMIN_ENABLE_OID}.{index}" for index in poe_indexes.values()),
-        key=_oid_key,
-    )
-
-
 def _write_allowed_text() -> str:
     return ", ".join(
         f"{name} ({oid})" for oid, name in WRITE_ALLOWED_SUBTREES.items()
@@ -255,27 +235,9 @@ def normalize_write_subtree(subtree: str) -> str:
     return oid
 
 
-def build_write_view_commands(
-    view_name: str, oid: str, excluded_oids: list[str]
-) -> list[str]:
-    """Linksys CLI: snmp view <ViewName> <OIDTree> {included | excluded}.
-
-    Exclusions are sent first so the view never includes a writable
-    column without the protected-port exclusions, even for a moment.
-    """
-    if not excluded_oids:
-        raise ValidationError(
-            "No ifAdminStatus exclusions configured. Refusing to build a "
-            "write view (fail-closed)."
-        )
-    if oid == POE_ADMIN_ENABLE_OID and not _poe_exclusions(excluded_oids):
-        raise ValidationError(
-            "No pethPsePortAdminEnable exclusions configured. Refusing to "
-            "add PoE to a write view (fail-closed)."
-        )
-    return [f"snmp view {view_name} {item} excluded" for item in excluded_oids] + [
-        f"snmp view {view_name} {oid} included"
-    ]
+def build_write_view_commands(view_name: str, oid: str) -> list[str]:
+    """Linksys CLI: snmp view <ViewName> <OIDTree> included (one writable column)."""
+    return [f"snmp view {view_name} {oid} included"]
 
 
 def build_community_create_commands(
@@ -301,8 +263,7 @@ def build_community_create_commands(
             raise ValidationError(
                 "write_view must differ from the read view (view_name). "
                 "The read view holds whole MIB subtrees; the write view "
-                "only the writable columns with the protected-port "
-                "exclusions."
+                "only the writable columns."
             )
         write = write_view
     else:
@@ -434,10 +395,32 @@ def parse_snmp_community(output: str) -> list[CommunityEntry]:
     return entries
 
 
-def parse_snmp_viewtree(output: str) -> list[ViewSubtree]:
-    """Parse show snmp viewtree. Assumed ISS key: value blocks; unconfirmed live."""
-    entries: list[ViewSubtree] = []
+_VIEW_NAME_LINE_RE = re.compile(r"(?im)^\s*view\s*name\s*:")
+
+
+def _view_records(output: str) -> list[str]:
+    """Viewtree blocks: split on dashed lines and before every View Name line.
+
+    Read-only check by Redy: the switch prints ``key : value`` blocks
+    (``Subtree OID  : 1``, ``Subtree Mask : 1``, ``View Type    : Included``).
+    Starting a block at each ``View Name`` line keeps entries apart even
+    if blocks are separated only by blank lines.
+    """
+    blocks: list[str] = []
     for record in _records(output):
+        starts = [match.start() for match in _VIEW_NAME_LINE_RE.finditer(record)]
+        if len(starts) <= 1:
+            blocks.append(record)
+            continue
+        cuts = [0, *starts[1:], len(record)]
+        blocks += [record[a:b].strip() for a, b in pairwise(cuts) if record[a:b].strip()]
+    return blocks
+
+
+def parse_snmp_viewtree(output: str) -> list[ViewSubtree]:
+    """Parse show snmp viewtree (ISS key : value blocks, format per Redy's read check)."""
+    entries: list[ViewSubtree] = []
+    for record in _view_records(output):
         fields = _fields(record)
         name = _field(fields, "view name", "viewname")
         oid = _field(fields, "subtree oid", "subtreeoid", "oid tree", "oidtree", "subtree")
@@ -547,16 +530,54 @@ def redact_community_listing(text: str, *, names: list[str] | None = None) -> st
     return redacted
 
 
-# Accepted spellings of an all-ones mask (exact subtree match, no
-# wildcard). RFC 3415: a missing or short mask is extended with ones. Any
-# other mask could wildcard sub-identifiers and is treated as unknown.
-_EXACT_MASK_RE = re.compile(
-    r"^(?:|-|none|n/a|1(?:\.1)*|(?:0x)?f+|ff(?:[:\s]ff)*)$", re.IGNORECASE
-)
+# Spellings of "no mask" (RFC 3415: a missing mask means all ones).
+_NO_MASK = frozenset({"", "-", "none", "n/a"})
+_DOTTED_BITS_RE = re.compile(r"^[01](?:\.[01])*$")
+_HEX_MASK_RE = re.compile(r"^(?:0x)?([0-9a-f]+)$", re.IGNORECASE)
+_HEX_OCTETS_RE = re.compile(r"^[0-9a-f]{2}(?:[:\s][0-9a-f]{2})*$", re.IGNORECASE)
 
 
-def mask_is_exact(mask: str) -> bool:
-    return bool(_EXACT_MASK_RE.fullmatch(mask.strip()))
+def _mask_bits(mask: str) -> str | None:
+    """Mask as a string of '0'/'1' (first bit = first sub-identifier), or None."""
+    text = mask.strip()
+    if text.lower() in _NO_MASK:
+        return ""
+    if _DOTTED_BITS_RE.fullmatch(text):
+        return text.replace(".", "")
+    hex_digits = None
+    if _HEX_OCTETS_RE.fullmatch(text):
+        hex_digits = re.sub(r"[:\s]", "", text)
+    else:
+        match = _HEX_MASK_RE.fullmatch(text)
+        if match and len(match.group(1)) % 2 == 0:
+            hex_digits = match.group(1)
+    if hex_digits is None:
+        return None
+    return "".join(f"{int(hex_digits[i:i + 2], 16):08b}" for i in range(0, len(hex_digits), 2))
+
+
+def mask_is_exact(mask: str, oid: str | None = None) -> bool:
+    """True if ``mask`` selects ``oid`` exactly (no wildcard sub-identifier).
+
+    RFC 3415: bit n of the mask belongs to sub-identifier n; a missing or
+    short mask is extended with ones, and bits beyond the OID length do
+    not matter. So a mask is exact when every bit that covers an arc of
+    ``oid`` is 1. Accepted spellings: empty/none, dotted bits (``1``,
+    ``1.1.1``; the switch prints ``Subtree Mask : 1``) and hex octets
+    (``ff``, ``ff:c0``, ``0xffc0``). Without ``oid`` every given bit must
+    be 1. Anything else is unknown and not exact (fail-closed).
+    """
+    if not isinstance(mask, str):
+        return False
+    bits = _mask_bits(mask)
+    if bits is None:
+        return False
+    if oid is None:
+        return "0" not in bits
+    arcs = oid_arcs(oid)
+    if arcs is None:
+        return False
+    return "0" not in bits[: len(arcs)]
 
 
 _OID_ARC_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
@@ -623,7 +644,7 @@ def view_entry_problem(entries: list[ViewSubtree], view_name: str) -> str | None
                 f"view {view_name!r} has subtree {entry.oid!r} in an "
                 "unrecognised OID format"
             )
-        if not mask_is_exact(entry.mask):
+        if not mask_is_exact(entry.mask, entry.oid):
             return (
                 f"view {view_name!r} has subtree {canonical_oid(entry.oid)} with an "
                 "unrecognised mask (could be a wildcard)"
@@ -715,22 +736,16 @@ def view_is_restricted(entries: list[ViewSubtree], view_name: str) -> tuple[bool
     )
 
 
-def view_is_write_safe(
-    entries: list[ViewSubtree], view_name: str, excluded_oids: list[str]
-) -> tuple[bool, str]:
+def view_is_write_safe(entries: list[ViewSubtree], view_name: str) -> tuple[bool, str]:
     """Strict check of a write view (fail-closed).
 
-    Every entry of the view must have an explicit included/excluded type
-    and an exact mask; included subtrees must be columns in
-    WRITE_ALLOWED_SUBTREES (never a whole MIB subtree); every exclusion in
-    ``excluded_oids`` must be present as an excluded entry. A view that
-    includes pethPsePortAdminEnable must also be checked against PoE
-    exclusions (see write_view_exclusions); without any, it is refused.
+    Every entry of the view must have an explicit included/excluded type,
+    a parseable OID and an exact mask; it must include at least one
+    subtree, and every included subtree must be a column in
+    WRITE_ALLOWED_SUBTREES (never a whole MIB subtree). Excluded entries
+    only narrow the view and are allowed, but none are required: the
+    protected ports are not excluded at view level.
     """
-    if not excluded_oids:
-        return False, (
-            f"no ifAdminStatus exclusions configured for write view {view_name!r}"
-        )
     variants = case_variant_view_names(entries, view_name)
     if variants:
         return False, "write " + case_variant_note(view_name, variants)
@@ -741,14 +756,11 @@ def view_is_write_safe(
     if problem:
         return False, "write " + problem
     included: list[str] = []
-    excluded: set[str] = set()
     for entry in own:
         oid = canonical_oid(entry.oid) or entry.oid.strip()
         if entry.view_type in {"included", "include"}:
             included.append(oid)
-        elif entry.view_type in {"excluded", "exclude"}:
-            excluded.add(oid)
-        else:
+        elif entry.view_type not in {"excluded", "exclude"}:
             return False, (
                 f"write view {view_name!r} has subtree {oid} without a "
                 "recognised included/excluded type"
@@ -767,69 +779,7 @@ def view_is_write_safe(
                 f"write view {view_name!r} includes subtree {oid}, which is "
                 "not allowed in a write view"
             )
-    if POE_ADMIN_ENABLE_OID in included and not _poe_exclusions(excluded_oids):
-        return False, (
-            f"write view {view_name!r} includes pethPsePortAdminEnable but no "
-            "PoE exclusions are configured (SWITCH_SNMP_PROTECTED_POE_INDEXES)"
-        )
-    missing = [oid for oid in excluded_oids if oid not in excluded]
-    missing_admin = [oid for oid in missing if not _is_poe_exclusion(oid)]
-    missing_poe = [oid for oid in missing if _is_poe_exclusion(oid)]
-    if missing_admin:
-        return False, (
-            f"write view {view_name!r} is missing the ifAdminStatus "
-            "exclusion(s) " + ", ".join(missing_admin)
-        )
-    if missing_poe:
-        return False, (
-            f"write view {view_name!r} is missing the pethPsePortAdminEnable "
-            "exclusion(s) " + ", ".join(missing_poe)
-        )
-    return True, (
-        f"write view {view_name} includes only "
-        + ", ".join(included)
-        + " and excludes "
-        + ", ".join(excluded_oids)
-    )
-
-
-def _is_poe_exclusion(oid: str) -> bool:
-    return oid_within(oid, POE_ADMIN_ENABLE_OID) and oid_arcs(oid) != oid_arcs(
-        POE_ADMIN_ENABLE_OID
-    )
-
-
-def _poe_exclusions(oids: list[str]) -> list[str]:
-    return [oid for oid in oids if _is_poe_exclusion(oid)]
-
-
-def required_write_exclusions() -> list[str]:
-    """ifAdminStatus exclusions from SWITCH_SNMP_PROTECTED_IFINDEXES (or raise)."""
-    return protected_admin_status_oids(parse_protected_ifindexes())
-
-
-def required_poe_exclusions() -> list[str]:
-    """pethPsePortAdminEnable exclusions from SWITCH_SNMP_PROTECTED_POE_INDEXES (or raise)."""
-    return protected_poe_admin_oids(parse_protected_poe_indexes())
-
-
-def write_view_exclusions(
-    entries: list[ViewSubtree], view_name: str, *, adding: str | None = None
-) -> list[str]:
-    """Exclusions a write view must carry, or raise ValidationError (fail-closed).
-
-    ifAdminStatus of the protected ports is always excluded. If the view
-    includes (or ``adding`` adds) pethPsePortAdminEnable, the protected PoE
-    ports are excluded as well, which requires a valid
-    SWITCH_SNMP_PROTECTED_POE_INDEXES.
-    """
-    included = set(view_included_oids(entries, view_name))
-    if adding is not None:
-        included.add(adding)
-    exclusions = required_write_exclusions()
-    if POE_ADMIN_ENABLE_OID in included:
-        exclusions += required_poe_exclusions()
-    return exclusions
+    return True, f"write view {view_name} includes only " + ", ".join(included)
 
 
 def _model_is_v2c(model: str) -> bool:
@@ -867,9 +817,7 @@ def assert_configured_community_ready(
     """Verify the configured community is present and view-restricted.
 
     A write view (anything other than ``none``) must differ from the read
-    view and pass view_is_write_safe with the exclusions from
-    write_view_exclusions (ifAdminStatus always, pethPsePortAdminEnable
-    when the write view includes PoE). If expected views are given
+    view and pass view_is_write_safe (only the writable columns). If expected views are given
     (after a create), the access entries must name exactly those views;
     ``expected_write_view=None`` then means the write view must be none.
 
@@ -968,14 +916,7 @@ def assert_configured_community_ready(
                     "read and write (no read/write split). Refusing to "
                     "remove another community."
                 )
-            try:
-                exclusions = write_view_exclusions(views, write)
-            except ValidationError as exc:
-                raise ValidationError(
-                    "Configured community has write access, but the "
-                    f"protected-port exclusions are not usable: {exc}"
-                ) from None
-            ok, note = view_is_write_safe(views, write, exclusions)
+            ok, note = view_is_write_safe(views, write)
             if not ok:
                 raise ValidationError(
                     note[:1].upper() + note[1:] + ". Refusing to remove another community."

@@ -41,7 +41,6 @@ from netmiko_mcp_linksys.connection import (
 )
 from netmiko_mcp_linksys.snmp_cli import (
     CLI_SOURCE,
-    POE_ADMIN_ENABLE_OID,
     POE_SUBTREE,
     READBACK_SNMP_ACCESS,
     READBACK_SNMP_COMMUNITY,
@@ -60,15 +59,12 @@ from netmiko_mcp_linksys.snmp_cli import (
     case_variant_note,
     case_variant_view_names,
     format_sent_commands,
-    mask_is_exact,
     normalize_subtree,
     normalize_write_subtree,
     oid_within,
     parse_snmp_access,
     parse_snmp_community,
     parse_snmp_viewtree,
-    required_poe_exclusions,
-    required_write_exclusions,
     resolve_removable_community_name,
     user_present,
     view_entry_problem,
@@ -76,7 +72,6 @@ from netmiko_mcp_linksys.snmp_cli import (
     view_included_oids,
     view_is_restricted,
     view_is_write_safe,
-    write_view_exclusions,
 )
 from netmiko_mcp_linksys.validation import (
     ValidationError,
@@ -109,8 +104,9 @@ mcp = MCPServer(
         "snmp_community_create, snmp_community_remove, snmp_user_remove) "
         "are narrow and must be "
         "gated by hub unlock, like save_config. Write views hold only "
-        "ifAdminStatus, ifAlias and pethPsePortAdminEnable, always with "
-        "hard exclusions for the protected ports. The community secret comes "
+        "ifAdminStatus, ifAlias and pethPsePortAdminEnable; the protected "
+        "ports are refused by the port tools only, not in the SNMP view. "
+        "The community secret comes "
         "only from SWITCH_SNMP_COMMUNITY and is redacted as [REDACTED]. "
         "Changes are not saved until save_config is called."
     ),
@@ -605,7 +601,7 @@ def _precheck_read_view(conn: Any, view_name: str, oid: str) -> None:
     Write views hold only the writable columns; adding e.g. the whole
     POWER-ETHERNET-MIB or ifTable there would widen write access. OIDs are
     compared by arcs after the central normalization (oid_arcs), so
-    ``.1.3.6…`` or ``iso.3.6…`` spellings cannot hide exclusions; entries
+    ``.1.3.6…`` or ``iso.3.6…`` spellings cannot hide a column; entries
     with an unparseable OID or a partial (wildcard) mask are refused.
     """
     label = "POWER-ETHERNET-MIB" if oid == POE_SUBTREE else f"subtree {oid}"
@@ -640,13 +636,14 @@ def _precheck_read_view(conn: Any, view_name: str, oid: str) -> None:
     for item in views:
         if item.name != view_name:
             continue
-        # Any exclusion marks a write view: read views never get one.
+        # Read views built by this server hold only included subtrees;
+        # anything else (an exclusion, a writable column) is refused.
         if item.view_type not in {"included", "include"} or any(
             oid_within(item.oid, column) for column in WRITE_ALLOWED_SUBTREES
         ):
             raise ValidationError(
-                f"View {view_name!r} has protected-port exclusions or writable "
-                f"columns ({canonical_oid(item.oid)}), so it is a write view. "
+                f"View {view_name!r} has an excluded entry or a writable "
+                f"column ({canonical_oid(item.oid)}), so it is a write view. "
                 f"{label} may only be added to a read view."
             )
 
@@ -657,8 +654,8 @@ def snmp_view_create(view_name: str, subtree: str) -> str:
 
     Gate this in the hub with unlock. subtree must be an OID or alias from
     the fixed allowlist (interfaces / ifmib / power-ethernet). Refused for
-    any view used as a write view or carrying protected-port exclusions;
-    build write views with snmp_write_view_create. The CLI syntax is not
+    any view used as a write view, holding a writable column or an
+    excluded entry; build write views with snmp_write_view_create. The CLI syntax is not
     live-confirmed; see the README.
     """
     params = {"view_name": view_name, "subtree": subtree}
@@ -708,36 +705,27 @@ def snmp_view_create(view_name: str, subtree: str) -> str:
 
 @mcp.tool()
 def snmp_write_view_create(view_name: str, subtree: str) -> str:
-    """Add one writable column to an SNMP write view, with port exclusions. Does not save.
+    """Add one writable column to an SNMP write view. Does not save.
 
     Gate this in the hub with unlock. subtree must be ifAdminStatus
     (1.3.6.1.2.1.2.2.1.7), ifAlias (1.3.6.1.2.1.31.1.1.1.18) or
     pethPsePortAdminEnable (1.3.6.1.2.1.105.1.1.1.3, PoE on/off); whole
-    MIB subtrees are never allowed in a write view. Every call first sends
-    ``snmp view <view> 1.3.6.1.2.1.2.2.1.7.<ifIndex> excluded`` for each
-    port in SWITCH_SNMP_PROTECTED_IFINDEXES (required, fail-closed). If
-    the view includes or gets pethPsePortAdminEnable, it also sends
-    ``snmp view <view> 1.3.6.1.2.1.105.1.1.1.3.<group>.<port> excluded``
-    for each port in SWITCH_SNMP_PROTECTED_POE_INDEXES (then required,
-    fail-closed). All-or-nothing in two stages: the missing exclusions
-    first (stop at the first "%" error) and verified in the read-back,
-    only then the included column, verified again. Any failure removes
-    what this call added (``no snmp view <view> <oid>``) and checks that
-    the viewtree equals the state before. The CLI syntax and both index
-    mappings are not live-confirmed.
+    MIB subtrees are never allowed in a write view. There are no per-port
+    exclusions: anyone with a community bound to this view can write
+    these columns for every port, including SWITCH_PROTECTED_PORTS. The
+    command is sent with a "%" error check and verified in show snmp
+    viewtree; on any failure the column is removed again
+    (``no snmp view <view> <oid>``) and the viewtree must equal the state
+    before. The CLI syntax is not live-confirmed.
     """
     params = {"view_name": view_name, "subtree": subtree}
     try:
         require_snmp_write_enabled()
         view_name = validate_snmp_name(view_name, what="view name")
         oid = normalize_write_subtree(subtree)
-        # Fail before connecting when an index mapping is unusable.
-        required_write_exclusions()
-        if oid == POE_ADMIN_ENABLE_OID:
-            required_poe_exclusions()
 
         def _run(conn: Any) -> str:
-            before = parse_snmp_viewtree(_snmp_exec(conn, READBACK_SNMP_VIEW))
+            _, before = _read_views(conn)
             if not before:
                 raise ValidationError(
                     "Could not parse show snmp viewtree (unknown table layout). "
@@ -745,8 +733,7 @@ def snmp_write_view_create(view_name: str, subtree: str) -> str:
                     "be verified. Confirm the output format live."
                 )
             _precheck_write_view_target(before, view_name)
-            exclusions = write_view_exclusions(before, view_name, adding=oid)
-            return _apply_write_view(conn, view_name, oid, exclusions, before)
+            return _apply_write_view(conn, view_name, oid, before)
 
         body = run_in_session(_run, enable_session_log=False)
     except ValidationError as exc:
@@ -756,203 +743,82 @@ def snmp_write_view_create(view_name: str, subtree: str) -> str:
     return _ok("snmp_write_view_create", params, redact_secrets(body))
 
 
-_INCLUDED = frozenset({"included", "include"})
-_EXCLUDED = frozenset({"excluded", "exclude"})
-
-
-def _has_entry(
-    views: list[ViewSubtree], view_name: str, oid: str, types: frozenset[str]
-) -> bool:
-    """Exact view name, same OID by arcs, given type, exact mask."""
-    return any(
-        item.name == view_name
-        and canonical_oid(item.oid) == oid
-        and item.view_type in types
-        and mask_is_exact(item.mask)
-        for item in views
-    )
-
-
 def _read_views(conn: Any) -> tuple[str, list[ViewSubtree]]:
     text = _snmp_exec(conn, READBACK_SNMP_VIEW)
     return text, parse_snmp_viewtree(text)
 
 
 def _rollback_write_view(
-    conn: Any,
-    view_name: str,
-    include_oid: str | None,
-    exclusions: list[str],
-    before: list[ViewSubtree],
+    conn: Any, view_name: str, oid: str, before: list[ViewSubtree]
 ) -> str:
-    """Undo what this call added, include first, then verify against ``before``.
+    """Remove the column this call added and verify the viewtree against ``before``.
 
-    Linksys CLI: ``no snmp view <ViewName> <OIDTree>``. Rule: an exclusion
-    is never removed while an included subtree it protects is still in
-    the view (Cody, retest of d4014b4).
-
-    1. If this call added ``include_oid``, remove only that and read the
-       viewtree back. If it is still there, or the read-back is unclear,
-       stop at once and keep every exclusion.
-    2. Only then remove this call's exclusions, except any that still
-       protect an included subtree of the view, and compare the viewtree
-       with ``before``.
+    Linksys CLI: ``no snmp view <ViewName> <OIDTree>``.
     """
     send_note = ""
-
-    def _send_removals(oids: list[str], **kwargs: Any) -> None:
-        nonlocal send_note
-        try:
-            _send_config(
-                conn, [f"no snmp view {view_name} {oid}" for oid in oids], **kwargs
-            )
-        except Exception:  # noqa: BLE001 — judged by the read-back
-            send_note = " The switch reported an error for at least one removal."
-
-    def _current() -> list[ViewSubtree] | None:
-        try:
-            _, views = _read_views(conn)
-        except Exception:  # noqa: BLE001 — an unreadable state is "unclear"
-            return None
-        if not views or view_entry_problem(views, view_name):
-            return None
-        return views
-
-    def _include_left(views: list[ViewSubtree]) -> bool:
-        return include_oid in set(view_included_oids(views, view_name))
-
-    if include_oid is not None:
-        _send_removals([include_oid], error_pattern=CONFIG_ERROR_PATTERN)
-        now = _current()
-        if now is None or _include_left(now):
-            state = "unclear (read-back failed)" if now is None else "still present"
-            return (
-                f"ROLLBACK NOT VERIFIED: the included column {include_oid} is "
-                f"{state} in view {view_name}; the exclusions were kept "
-                "(an exclusion is never removed while its column may be "
-                f"included). Check show snmp viewtree for {view_name} now, and "
-                "check show snmp group access: communities already bound to "
-                f"this view may be affected. Do not bind a community to {view_name} "
-                "until it is fixed." + send_note
-            )
-    else:
-        now = _current()
-    if now is None:
-        return (
-            f"ROLLBACK NOT VERIFIED: show snmp viewtree could not be read "
-            f"cleanly, so the exclusions of view {view_name} were kept. Check "
-            "the view and its community bindings on the switch before using "
-            "it; do not bind a community to it." + send_note
+    try:
+        _send_config(
+            conn, [f"no snmp view {view_name} {oid}"], error_pattern=CONFIG_ERROR_PATTERN
         )
-    included = view_included_oids(now, view_name)
-    kept = [
-        oid for oid in exclusions if any(oid_within(oid, column) for column in included)
-    ]
-    removable = [oid for oid in exclusions if oid not in kept]
-    if removable:
-        _send_removals(removable)
+    except Exception:  # noqa: BLE001 — judged by the read-back
+        send_note = " The switch reported an error for the removal."
     try:
         _, after = _read_views(conn)
         restored = bool(after) and view_entry_set(after) == view_entry_set(before)
     except Exception:  # noqa: BLE001 — an unreadable state is "not verified"
         restored = False
-    undone = ", ".join(([include_oid] if include_oid else []) + removable) or "nothing"
     if restored:
         return (
-            f"Rolled back (removed {undone}); show snmp viewtree matches "
-            "the state before this call." + send_note
+            f"Rolled back (removed {oid}); show snmp viewtree matches the "
+            "state before this call." + send_note
         )
-    kept_note = (
-        f" Kept exclusion(s) {', '.join(kept)} because they protect a column "
-        "that is still included."
-        if kept
-        else ""
-    )
     return (
-        f"ROLLBACK NOT VERIFIED (tried to remove {undone}): show snmp "
-        "viewtree does not match the state before this call." + kept_note
-        + f" Check the view {view_name} on the switch before using it; do not "
-        "bind a community to it." + send_note
+        f"ROLLBACK NOT VERIFIED (tried to remove {oid}): show snmp viewtree "
+        f"does not match the state before this call. Check the view {view_name} "
+        "and its community bindings (show snmp group access) on the switch "
+        "now; do not bind a community to it." + send_note
     )
 
 
 def _apply_write_view(
-    conn: Any,
-    view_name: str,
-    oid: str,
-    exclusions: list[str],
-    before: list[ViewSubtree],
+    conn: Any, view_name: str, oid: str, before: list[ViewSubtree]
 ) -> str:
-    """Two-stage, all-or-nothing write view change (fail-closed).
+    """Add the column (if missing) and verify the whole write view (fail-closed).
 
-    1. Send only the exclusions that are not there yet, with
-       error_pattern, and verify every exclusion in the read-back. On any
-       failure the new exclusions are rolled back and the included column
-       is never sent.
-    2. Send the included column (if not there yet), with error_pattern,
-       and verify the whole write view. On any failure the column and the
-       new exclusions are rolled back.
-    After a rollback the viewtree must equal the state before the call.
+    The command is sent with error_pattern; the read-back must show a
+    view that includes only writable columns, among them ``oid``. On any
+    failure a column added by this call is removed again.
     """
-    # The builder enforces "no exclusions, no write view" and "no PoE
-    # column without PoE exclusions"; its last line is the include.
-    planned = build_write_view_commands(view_name, oid, exclusions)
-    include_command = planned[-1]
-    new_exclusions = [
-        item for item in exclusions if not _has_entry(before, view_name, item, _EXCLUDED)
-    ]
-    include_new = not _has_entry(before, view_name, oid, _INCLUDED)
-    sent: list[str] = []
-
-    if new_exclusions:
-        exclude_commands = [
-            line for line in planned[:-1] if line.split()[3] in new_exclusions
-        ]
-        try:
-            _send_config(conn, exclude_commands, error_pattern=CONFIG_ERROR_PATTERN)
-            sent += exclude_commands
-            _, middle = _read_views(conn)
-            missing = [
-                item
-                for item in exclusions
-                if not _has_entry(middle, view_name, item, _EXCLUDED)
-            ]
-            if missing:
-                raise ValidationError(
-                    "exclusion(s) missing in show snmp viewtree: " + ", ".join(missing)
-                )
-        except Exception as exc:  # noqa: BLE001 — every failure must roll back
-            rollback = _rollback_write_view(conn, view_name, None, new_exclusions, before)
-            raise SwitchConnectionError(
-                "Exclusions were not applied, the included column "
-                f"{oid} was NOT sent: {redact_secrets(str(exc))}. {rollback}"
-            ) from None
-
+    include_new = oid not in set(view_included_oids(before, view_name))
+    commands = build_write_view_commands(view_name, oid) if include_new else []
     try:
-        if include_new:
-            _send_config(conn, [include_command], error_pattern=CONFIG_ERROR_PATTERN)
-            sent.append(include_command)
+        if commands:
+            _send_config(conn, commands, error_pattern=CONFIG_ERROR_PATTERN)
         view_out, after = _read_views(conn)
-        ok, note = view_is_write_safe(
-            after, view_name, write_view_exclusions(after, view_name)
-        )
+        ok, note = view_is_write_safe(after, view_name)
         if not ok:
             raise ValidationError(note)
         if oid not in set(view_included_oids(after, view_name)):
             raise ValidationError(f"write view {view_name!r} does not include {oid}")
     except Exception as exc:  # noqa: BLE001 — every failure must roll back
-        rollback = _rollback_write_view(
-            conn, view_name, oid if include_new else None, new_exclusions, before
-        )
+        if not include_new:
+            if isinstance(exc, ValidationError):
+                raise ValidationError(
+                    f"Nothing was sent: {exc}. Fix the view on the switch first."
+                ) from None
+            raise SwitchConnectionError(
+                f"Nothing was sent; the read-back failed: {redact_secrets(str(exc))}"
+            ) from None
+        rollback = _rollback_write_view(conn, view_name, oid, before)
         raise SwitchConnectionError(
             "Configuration was sent, verification failed: "
             f"{redact_secrets(str(exc))}. {rollback}"
         ) from None
 
     head = (
-        format_sent_commands(sent) + "\n\nConfiguration sent.\n"
-        if sent
-        else "Nothing to send: the column and all exclusions were already present.\n"
+        format_sent_commands(commands) + "\n\nConfiguration sent.\n"
+        if commands
+        else "Nothing to send: the column was already included.\n"
     )
     return (
         head
@@ -981,7 +847,7 @@ def _precheck_write_view_target(views: list[ViewSubtree], view_name: str) -> Non
     for item in views:
         if item.name != view_name:
             continue
-        if item.view_type in _EXCLUDED:
+        if item.view_type in {"excluded", "exclude"}:
             continue
         compact = canonical_oid(item.oid)
         if compact not in WRITE_ALLOWED_SUBTREES:
@@ -1017,9 +883,7 @@ def _precheck_view_for_community(
         )
     if write_view is None:
         return
-    ok, note = view_is_write_safe(
-        views, write_view, write_view_exclusions(views, write_view)
-    )
+    ok, note = view_is_write_safe(views, write_view)
     if not ok:
         raise ValidationError(
             note[:1].upper()
@@ -1037,9 +901,7 @@ def snmp_community_create(
 
     view_name is the read view. access is 'ro' or 'rw'; 'rw' requires a
     separate write_view built with snmp_write_view_create (only the
-    writable columns, with the SWITCH_SNMP_PROTECTED_IFINDEXES exclusions
-    and, if it includes PoE, the SWITCH_SNMP_PROTECTED_POE_INDEXES
-    exclusions). The secret is never
+    writable columns, no per-port exclusions). The secret is never
     a tool argument and is redacted as [REDACTED] in all output. Does not
     save. Gate with hub unlock. The CLI syntax is not live-confirmed; see
     the README.
@@ -1052,10 +914,6 @@ def snmp_community_create(
         if write_view is not None:
             write_view = validate_snmp_name(write_view, what="write view name")
         community = validate_snmp_community_secret()
-        if access == "rw":
-            # Fail before connecting; PoE exclusions are checked against
-            # the write view's read-back in the precheck.
-            required_write_exclusions()
         commands = build_community_create_commands(
             view_name, access, community, write_view
         )
