@@ -157,7 +157,11 @@ def test_run_save_sends_only_save(monkeypatch: pytest.MonkeyPatch) -> None:
         patch("netmiko_mcp_linksys.connection.send_paged", return_value="success") as paged,
     ):
         assert run_save() == "success"
-    paged.assert_called_once_with(conn, "save")
+    paged.assert_called_once()
+    assert paged.call_args.args == (conn, "save")
+    pattern, answer = paged.call_args.kwargs["confirm"]
+    assert answer == "y"
+    assert pattern.search("Overwrite startup-config? (y/n)")
     conn.send_config_set.assert_not_called()
 
 
