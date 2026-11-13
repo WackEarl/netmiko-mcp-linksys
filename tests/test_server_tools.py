@@ -100,6 +100,7 @@ def test_tools_registered() -> None:
         "port_set_description",
         "save_config",
         "snmp_view_create",
+        "snmp_write_view_create",
         "snmp_community_create",
         "snmp_community_remove",
         "snmp_user_remove",
