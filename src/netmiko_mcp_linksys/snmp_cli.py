@@ -559,8 +559,71 @@ def mask_is_exact(mask: str) -> bool:
     return bool(_EXACT_MASK_RE.fullmatch(mask.strip()))
 
 
-def compact_oid(oid: str) -> str:
-    return oid.strip().rstrip(".")
+_OID_ARC_RE = re.compile(r"^(?:0|[1-9][0-9]*)$")
+
+
+def oid_arcs(oid: str) -> tuple[int, ...] | None:
+    """Parse an OID as printed by the switch into its arcs, or None.
+
+    The one central OID normalization (Cody, review of bc96149): surrounding
+    whitespace, one leading dot, a leading ``iso`` arc (= 1) and trailing
+    dots are accepted, so ``.1.3.6.1``, ``iso.3.6.1``, ``.iso.3.6.1.`` and
+    ``1.3.6.1`` are the same OID. Anything else (empty arcs, signs, leading
+    zeros, other names, masks or extra tokens) is None, and callers must
+    treat None as "refuse" (fail-closed).
+    """
+    if not isinstance(oid, str):
+        return None
+    text = oid.strip().removeprefix(".").rstrip(".")
+    if not text:
+        return None
+    parts = text.split(".")
+    if parts[0].lower() == "iso":
+        parts[0] = "1"
+    if not all(_OID_ARC_RE.fullmatch(part) for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def canonical_oid(oid: str) -> str | None:
+    """Dotted numeric form of ``oid`` (see oid_arcs), or None if unparseable."""
+    arcs = oid_arcs(oid)
+    return None if arcs is None else ".".join(str(arc) for arc in arcs)
+
+
+def oid_within(oid: str, subtree: str) -> bool:
+    """True if ``oid`` equals ``subtree`` or lies below it, compared by arcs.
+
+    1.3.6.1.2.1.105 is not within 1.3.6.1.2.1.10. Unparseable input is
+    never within anything (callers refuse it separately).
+    """
+    arcs, prefix = oid_arcs(oid), oid_arcs(subtree)
+    if arcs is None or prefix is None:
+        return False
+    return arcs[: len(prefix)] == prefix
+
+
+def view_entry_problem(entries: list[ViewSubtree], view_name: str) -> str | None:
+    """Why the entries of exactly ``view_name`` cannot be trusted, or None.
+
+    Every entry needs a parseable OID and an exact (empty or all-ones)
+    mask; a partial mask could wildcard sub-identifiers, so the entry
+    would cover more (or other) OIDs than it shows (fail-closed).
+    """
+    for entry in entries:
+        if entry.name != view_name:
+            continue
+        if oid_arcs(entry.oid) is None:
+            return (
+                f"view {view_name!r} has subtree {entry.oid!r} in an "
+                "unrecognised OID format"
+            )
+        if not mask_is_exact(entry.mask):
+            return (
+                f"view {view_name!r} has subtree {canonical_oid(entry.oid)} with an "
+                "unrecognised mask (could be a wildcard)"
+            )
+    return None
 
 
 def case_variant_view_names(entries: list[ViewSubtree], view_name: str) -> list[str]:
@@ -590,15 +653,32 @@ def case_variant_note(view_name: str, variants: list[str]) -> str:
 
 
 def view_included_oids(entries: list[ViewSubtree], view_name: str) -> list[str]:
-    """Included subtrees of exactly ``view_name`` (case-sensitive)."""
+    """Included subtrees of exactly ``view_name`` (case-sensitive), canonical.
+
+    An unparseable OID is returned stripped as-is, so it matches no
+    allowlist; checks refuse it via view_entry_problem first.
+    """
     oids: list[str] = []
     for entry in entries:
         if entry.name != view_name:
             continue
         if entry.view_type and entry.view_type not in {"included", "include"}:
             continue
-        oids.append(entry.oid)
+        oids.append(canonical_oid(entry.oid) or entry.oid.strip())
     return oids
+
+
+def view_entry_set(entries: list[ViewSubtree]) -> set[tuple[str, str, str, str]]:
+    """Comparable snapshot of a viewtree (name, OID, type, mask)."""
+    return {
+        (
+            entry.name,
+            canonical_oid(entry.oid) or entry.oid.strip(),
+            entry.view_type,
+            entry.mask.strip(),
+        )
+        for entry in entries
+    }
 
 
 def view_is_restricted(entries: list[ViewSubtree], view_name: str) -> tuple[bool, str]:
@@ -609,14 +689,11 @@ def view_is_restricted(entries: list[ViewSubtree], view_name: str) -> tuple[bool
     oids = view_included_oids(entries, view_name)
     if not oids:
         return False, f"view {view_name!r} has no included subtrees in the read-back"
-    for entry in entries:
-        if entry.name == view_name and not mask_is_exact(entry.mask):
-            return False, (
-                f"view {view_name!r} has subtree {entry.oid} with an "
-                "unrecognised mask (could be a wildcard)"
-            )
+    problem = view_entry_problem(entries, view_name)
+    if problem:
+        return False, problem
     for oid in oids:
-        compact = oid.strip().rstrip(".")
+        compact = oid
         if compact in BROAD_OIDS:
             return False, (
                 f"view {view_name!r} includes a broad subtree {oid} "
@@ -655,15 +732,13 @@ def view_is_write_safe(
     own = [entry for entry in entries if entry.name == view_name]
     if not own:
         return False, f"write view {view_name!r} was not found in the read-back"
+    problem = view_entry_problem(entries, view_name)
+    if problem:
+        return False, "write " + problem
     included: list[str] = []
     excluded: set[str] = set()
     for entry in own:
-        oid = compact_oid(entry.oid)
-        if not mask_is_exact(entry.mask):
-            return False, (
-                f"write view {view_name!r} has subtree {oid} with an "
-                "unrecognised mask (could be a wildcard)"
-            )
+        oid = canonical_oid(entry.oid) or entry.oid.strip()
         if entry.view_type in {"included", "include"}:
             included.append(oid)
         elif entry.view_type in {"excluded", "exclude"}:
@@ -714,7 +789,9 @@ def view_is_write_safe(
 
 
 def _is_poe_exclusion(oid: str) -> bool:
-    return oid.startswith(POE_ADMIN_ENABLE_OID + ".")
+    return oid_within(oid, POE_ADMIN_ENABLE_OID) and oid_arcs(oid) != oid_arcs(
+        POE_ADMIN_ENABLE_OID
+    )
 
 
 def _poe_exclusions(oids: list[str]) -> list[str]:
@@ -741,7 +818,7 @@ def write_view_exclusions(
     ports are excluded as well, which requires a valid
     SWITCH_SNMP_PROTECTED_POE_INDEXES.
     """
-    included = {compact_oid(oid) for oid in view_included_oids(entries, view_name)}
+    included = set(view_included_oids(entries, view_name))
     if adding is not None:
         included.add(adding)
     exclusions = required_write_exclusions()
