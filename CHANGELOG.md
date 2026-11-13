@@ -64,6 +64,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Write views change all-or-nothing (Cody, review of bc96149). The
+  missing exclusions are sent first with `error_pattern="%"` and verified
+  in `show snmp viewtree`; the included column is sent only after that,
+  and verified again. On any failure (refused line, silently missing
+  entry, failed read-back) this call's entries are removed with
+  `no snmp view <view> <oid>` and the viewtree must equal the state
+  before, else the result says `ROLLBACK NOT VERIFIED`. Before, one
+  batch sent the include even if an exclusion was refused.
+- One central OID normalization (`oid_arcs`/`canonical_oid`/`oid_within`)
+  for all view checks, prechecks and read-backs: leading dot, `iso`,
+  trailing dots and whitespace are accepted, prefixes are compared by
+  whole arcs, and unknown formats or partial (wildcard) masks are refused,
+  also in the read-view precheck. Before, `.1.3.6…` or `iso.3.6…`
+  exclusions hid a write view from `snmp_view_create`, so the whole
+  POWER-ETHERNET-MIB could be added to it (Cody). The read-view precheck
+  now refuses any view with excluded entries or writable columns.
 - SNMP view names are compared exactly (case-sensitive) in all view
   checks (`view_is_restricted`, `view_is_write_safe`, the read-back
   checks, and the PoE/write-view prechecks). A view name that differs

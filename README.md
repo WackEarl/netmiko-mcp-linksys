@@ -137,7 +137,7 @@ Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 | `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back of `show interfaces description` for that port (verified, quoted, empty, probably truncated, or could not verify). | no |
 | `save_config()` | Privileged exec `save` only. Gate this in the hub with `unlock`. | yes |
 | `snmp_view_create(view_name, subtree)` | Add one **included** subtree from a fixed OID allowlist (`interfaces`, `ifmib`, `power-ethernet`) to a **read** view. Refused for a view that is used as a write view or carries protected-port exclusions. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
-| `snmp_write_view_create(view_name, subtree)` | Add one writable column to a **write** view: `ifAdminStatus` (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) or `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`, PoE on/off). Sends the ifAdminStatus exclusions from `SWITCH_SNMP_PROTECTED_IFINDEXES` and, for a view with PoE, the pethPsePortAdminEnable exclusions from `SWITCH_SNMP_PROTECTED_POE_INDEXES` first, then the included column. Whole MIB subtrees are never allowed. Strict read-back; refuses without the index mappings. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_write_view_create(view_name, subtree)` | Add one writable column to a **write** view: `ifAdminStatus` (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) or `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`, PoE on/off). Sends the ifAdminStatus exclusions from `SWITCH_SNMP_PROTECTED_IFINDEXES` and, for a view with PoE, the pethPsePortAdminEnable exclusions from `SWITCH_SNMP_PROTECTED_POE_INDEXES` first, then the included column, all-or-nothing with rollback (see below). Whole MIB subtrees are never allowed. Strict read-back; refuses without the index mappings. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 | `snmp_community_create(view_name, access, write_view=None)` | Create a v2c community from `SWITCH_SNMP_COMMUNITY` bound to an existing restricted read view (`view_name`). `ro`: write view `none`. `rw`: requires a separate `write_view` that passes the write-view check (including the PoE exclusions if it has PoE). The secret is never a tool argument. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 | `snmp_community_remove(name)` | Remove `public` or `private` only, and only after the configured community is verified present with a restricted view. Never removes the configured community. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 | `snmp_user_remove(name)` | Remove `noAuthUser` only. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
@@ -311,6 +311,32 @@ and before `snmp_community_remove`) only if, in `show snmp viewtree`:
   `SWITCH_SNMP_PROTECTED_POE_INDEXES` (and that variable must be valid);
 - it is not the same view as the read view.
 
+`snmp_write_view_create` changes a write view all-or-nothing, in two
+stages, each sent with netmiko `error_pattern="%"` (ISS error lines start
+with `%`, and netmiko stops at the first one):
+
+1. Only the exclusions that are not there yet are sent, then
+   `show snmp viewtree` must show every required exclusion. If a line is
+   refused, or an exclusion is silently missing, the exclusions sent by
+   this call are removed again and the included column is **never sent**.
+2. Only then the included column is sent, and the whole write view is
+   checked again. On any error the column and this call's exclusions are
+   removed (`no snmp view <view> <oid>`, column first).
+
+After a rollback `show snmp viewtree` must match the state before the
+call exactly; otherwise the result says `ROLLBACK NOT VERIFIED` and the
+view must not be bound to a community. Exclusions that existed before the
+call are never removed.
+
+OIDs from `show snmp viewtree` go through one normalization
+(`oid_arcs`): whitespace, one leading dot, a leading `iso` (= `1`) and
+trailing dots are accepted, so `.1.3.6.1…`, `iso.3.6.1…` and `1.3.6.1…`
+are the same OID. Prefixes are compared by whole arcs, so
+`1.3.6.1.2.1.105` is not below `1.3.6.1.2.1.10`. Any other format, and
+any entry with a mask that is not empty or all-ones (a possible
+wildcard), makes the check refuse (fail-closed), in the read-view
+precheck as well.
+
 After a create, the access entry must name exactly the requested read and
 write views. A failed check before sending refuses; after sending it is
 reported as "Configuration was sent, verification failed". Read views
@@ -380,6 +406,11 @@ HA only needs to read counters.
 - **ifIndex mapping** of 0/10 and 0/24 (walk `ifDescr` / `ifName`,
   `1.3.6.1.2.1.2.2.1.2` / `1.3.6.1.2.1.31.1.1.1.1`) before setting
   `SWITCH_SNMP_PROTECTED_IFINDEXES`.
+- That refused config lines print an error starting with `%` (the
+  write-view tools stop on it), and that `no snmp view <view> <oid>`
+  removes exactly that entry (used for rollback).
+- How `show snmp viewtree` prints OIDs (`1.3…`, `.1.3…`, `iso.3…`?);
+  other formats are refused.
 - That `snmp view <view> <oid> excluded` is accepted for an instance OID
   (`1.3.6.1.2.1.2.2.1.7.<ifIndex>`) without a mask, how
   `show snmp viewtree` prints the type (`excluded`?) and the mask

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import re as _re
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from netmiko.exceptions import ConfigInvalidException
 
 from netmiko_mcp_linksys.connection import (
     ConnectionError,
@@ -23,12 +25,15 @@ from netmiko_mcp_linksys.snmp_cli import (
     build_user_remove_commands,
     build_view_create_commands,
     build_write_view_commands,
+    canonical_oid,
     case_variant_view_names,
     format_sent_commands,
     group_name_for_view,
     mask_is_exact,
     normalize_subtree,
     normalize_write_subtree,
+    oid_arcs,
+    oid_within,
     parse_snmp_access,
     parse_snmp_community,
     parse_snmp_group,
@@ -1811,28 +1816,6 @@ def _rw_listing(new_view: str) -> dict[str, str]:
     }
 
 
-def test_snmp_write_view_create_happy_path(community_env: str, audit_log) -> None:
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    sent: list[list[str]] = []
-    session = _fake_snmp_session({READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED}, sent)
-    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
-        result = snmp_write_view_create("ifmib_w", "ifAdminStatus")
-    assert sent == [
-        [
-            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.124 excluded",
-            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.125 excluded",
-            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7 included",
-        ]
-    ]
-    assert (
-        "Read-back check: write view ifmib_w includes only 1.3.6.1.2.1.2.2.1.7 "
-        "and excludes" in result
-    )
-    assert not _secret_in(result, SECRET)
-    assert not _secret_in(audit_log.read_text(encoding="utf-8"), SECRET)
-
-
 @pytest.mark.parametrize(
     "subtree",
     ["power-ethernet", "1.3.6.1.2.1.105", "interfaces", "1.3.6.1.2.1.31", "ifmib"],
@@ -1879,32 +1862,6 @@ def test_snmp_write_view_create_prechecks_before_send(listing: str, message: str
     assert sent == []
     assert result.startswith("Rejected:")
     assert message in result
-
-
-def test_snmp_write_view_create_verification_failed_after_send(community_env: str) -> None:
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    calls: list[str] = []
-    incomplete = _views(
-        _view_block("ifmib_w", "1.3.6.1.2.1.2.2.1.7", "included"),
-        _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
-    )
-
-    def shows(command: str) -> str:
-        calls.append(command)
-        # Before: no ifmib_w yet. After: the device dropped one exclusion.
-        return VIEW_SHOW_WITH_POE if len(calls) == 1 else incomplete
-
-    sent: list[list[str]] = []
-    with patch(
-        "netmiko_mcp_linksys.server.run_in_session",
-        side_effect=_fake_snmp_session(shows, sent),
-    ):
-        result = snmp_write_view_create("ifmib_w", "ifAdminStatus")
-    assert len(sent) == 1
-    assert result.startswith("Error: Configuration was sent, verification failed:")
-    assert "1.3.6.1.2.1.2.2.1.7.125" in result
-    assert SECRET not in result
 
 
 def test_snmp_view_create_poe_allowed_on_read_view() -> None:
@@ -2163,7 +2120,8 @@ def test_cody_probe_r5(monkeypatch: pytest.MonkeyPatch) -> None:
         blk("wv", ".1.3.6.1.2.1.2.2.1.7.24", "excluded"),
         blk("wv", "1.3.6.1.2.1.2.2.1.7", "included"),
     )
-    assert not view_is_write_safe(leading_dot, "wv", ex)[0]
+    # One leading dot is the same OID (central normalization, review of bc96149).
+    assert view_is_write_safe(leading_dot, "wv", ex)[0]
     wildcard = tree(*good[:2], blk("wv", "1.3.6.1.2.1.2.2.1.7", "included", "ff:7f"))
     assert not view_is_write_safe(wildcard, "wv", ex)[0]
     for ports, idx in [
@@ -2513,60 +2471,6 @@ def test_port_0_15_is_not_locked(monkeypatch: pytest.MonkeyPatch) -> None:
         parse_protected_poe_indexes("0/10=1.10,0/24=1.24,0/15=1.15")
 
 
-def test_snmp_write_view_create_poe_happy_path(poe_env: None, audit_log) -> None:
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    calls: list[str] = []
-    before = _views(_read_view_ifmib(), _admin_only_write_view())
-
-    def shows(command: str) -> str:
-        calls.append(command)
-        return before if len(calls) == 1 else _views(_read_view_ifmib(), _poe_write_view())
-
-    sent: list[list[str]] = []
-    with patch(
-        "netmiko_mcp_linksys.server.run_in_session",
-        side_effect=_fake_snmp_session(shows, sent),
-    ):
-        result = snmp_write_view_create("ifmib_w", "pethPsePortAdminEnable")
-    assert sent == [
-        [
-            f"snmp view ifmib_w {ADMIN_COL}.110 excluded",
-            f"snmp view ifmib_w {ADMIN_COL}.124 excluded",
-            f"snmp view ifmib_w {POE_COL}.1.10 excluded",
-            f"snmp view ifmib_w {POE_COL}.1.24 excluded",
-            f"snmp view ifmib_w {POE_COL} included",
-        ]
-    ]
-    assert result.startswith("Configuration sent:")
-    assert f"Read-back check: write view ifmib_w includes only {ADMIN_COL}, {POE_COL}" in result
-    assert f"{POE_COL}.1.24" in result
-
-
-def test_snmp_write_view_create_ifalias_keeps_poe_exclusions(poe_env: None) -> None:
-    """Adding a column to a view that already has PoE re-sends the PoE exclusions."""
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    sent: list[list[str]] = []
-    after = _views(_poe_write_view(), _view_block("ifmib_w", ALIAS_COL, "included"))
-    calls: list[str] = []
-
-    def shows(command: str) -> str:
-        calls.append(command)
-        return _poe_write_view() if len(calls) == 1 else after
-
-    with patch(
-        "netmiko_mcp_linksys.server.run_in_session",
-        side_effect=_fake_snmp_session(shows, sent),
-    ):
-        result = snmp_write_view_create("ifmib_w", "ifAlias")
-    assert sent[0][:4] == [
-        f"snmp view ifmib_w {oid} excluded" for oid in LIVE_ADMIN_EXCL + LIVE_POE_EXCL
-    ]
-    assert sent[0][4:] == [f"snmp view ifmib_w {ALIAS_COL} included"]
-    assert "Read-back check: write view ifmib_w includes only" in result
-
-
 @pytest.mark.parametrize(
     ("poe_value", "message"),
     [
@@ -2619,29 +2523,6 @@ def test_snmp_write_view_create_poe_requires_write_flag(
     run.assert_not_called()
     assert result.startswith("Rejected:")
     assert "SWITCH_SNMP_WRITE_ENABLED" in result
-
-
-def test_snmp_write_view_create_poe_verification_failed_after_send(poe_env: None) -> None:
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    calls: list[str] = []
-
-    def shows(command: str) -> str:
-        calls.append(command)
-        # After the send the device lost the 0/10 PoE exclusion.
-        if len(calls) == 1:
-            return _admin_only_write_view()
-        return _poe_write_view(drop=f"{POE_COL}.1.10")
-
-    sent: list[list[str]] = []
-    with patch(
-        "netmiko_mcp_linksys.server.run_in_session",
-        side_effect=_fake_snmp_session(shows, sent),
-    ):
-        result = snmp_write_view_create("ifmib_w", POE_COL)
-    assert len(sent) == 1
-    assert result.startswith("Error: Configuration was sent, verification failed:")
-    assert f"pethPsePortAdminEnable exclusion(s) {POE_COL}.1.10" in result
 
 
 def _poe_rw_listing() -> dict[str, str]:
@@ -2750,3 +2631,490 @@ def test_snmp_view_create_refuses_view_with_only_poe_exclusions(poe_env: None) -
         result = snmp_view_create("pw", "power-ethernet")
     assert sent == []
     assert "has protected-port exclusions" in result
+
+
+# ---------------------------------------------------------------------------
+# Cody's review of bc96149 (r7.py / r7b.py) and Redy's additions:
+# write views change all-or-nothing (exclusions first, verified, include
+# only then, rollback to the exact previous viewtree on any failure), and
+# one central OID normalization with whole-arc prefix comparison; partial
+# masks are never treated as safe.
+# ---------------------------------------------------------------------------
+
+class FakeSwitch:
+    """Stateful viewtree stand-in for the netmiko connection.
+
+    Behaves like ISS + netmiko: each config line gets an output line, a
+    refused line prints "% Invalid input", and with ``error_pattern``
+    netmiko raises at the first matching line and sends nothing after it.
+    """
+
+    def __init__(
+        self,
+        views: list[tuple[str, str, str]] | None = None,
+        *,
+        refuse: Any = None,
+        silent_drop: Any = None,
+        access: str | None = None,
+    ) -> None:
+        self.views: list[tuple[str, str, str, str]] = [
+            (name, oid, typ, "") for name, oid, typ in (views or [("iso", "1", "included")])
+        ]
+        self.refuse = refuse or (lambda cmd: False)
+        self.silent_drop = silent_drop or (lambda cmd: False)
+        self.access = access or (
+            "Group Name: iso\nSecurity Model: v1\nRead View: iso\n"
+            "Write View: iso\nNotify View: iso\n"
+        )
+        self.batches: list[list[str]] = []
+        self.kwargs: list[dict[str, Any]] = []
+
+    def tree(self) -> str:
+        return "------------------------------\n".join(
+            _view_block(name, oid, typ, mask) for name, oid, typ, mask in self.views
+        )
+
+    def snapshot(self) -> list[tuple[str, str, str, str]]:
+        return list(self.views)
+
+    def _apply(self, cmd: str) -> None:
+        parts = cmd.split()
+        if parts[:3] == ["no", "snmp", "view"]:
+            name, oid = parts[3], parts[4]
+            before = len(self.views)
+            self.views = [v for v in self.views if not (v[0] == name and v[1] == oid)]
+            if len(self.views) == before:
+                raise KeyError(cmd)
+        elif parts[:2] == ["snmp", "view"]:
+            self.views.append((parts[2], parts[3], parts[4], ""))
+
+    def send_config_set(self, commands: list[str], **kwargs: Any) -> str:
+        self.kwargs.append(kwargs)
+        batch: list[str] = []
+        self.batches.append(batch)
+        output = ""
+        pattern = kwargs.get("error_pattern")
+        for cmd in commands:
+            batch.append(cmd)
+            line = cmd
+            if self.refuse(cmd):
+                line += "\n% Invalid input detected at '^' marker."
+            elif not self.silent_drop(cmd):
+                try:
+                    self._apply(cmd)
+                except KeyError:
+                    line += "\n% Entry not found"
+            output += line + "\n"
+            if pattern and _re.search(pattern, output, flags=_re.MULTILINE):
+                raise ConfigInvalidException(f"Invalid input detected at command: {cmd}")
+        return output
+
+    @property
+    def sent(self) -> list[str]:
+        return [cmd for batch in self.batches for cmd in batch]
+
+
+def _run_on(switch: FakeSwitch, tool: str, *args: str) -> str:
+    from netmiko_mcp_linksys import server
+
+    def exec_cmd(_conn: Any, command: str) -> str:
+        if command == READBACK_SNMP_VIEW:
+            return switch.tree()
+        if command == READBACK_SNMP_ACCESS:
+            return switch.access
+        raise AssertionError(f"unexpected show {command!r}")
+
+    with (
+        patch.object(server, "run_in_session", side_effect=lambda cb, **_k: cb(switch)),
+        patch.object(server, "_snmp_exec", side_effect=exec_cmd),
+    ):
+        return getattr(server, tool)(*args)
+
+
+_ADMIN_WV = [
+    ("wv", f"{ADMIN_COL}.110", "excluded"),
+    ("wv", f"{ADMIN_COL}.124", "excluded"),
+    ("wv", ADMIN_COL, "included"),
+]
+
+
+def _wv_entries(switch: FakeSwitch) -> list[tuple[str, str, str, str]]:
+    return [v for v in switch.views if v[0] == "wv"]
+
+
+# --- two-stage apply: happy paths -----------------------------------------
+
+
+def test_write_view_two_stage_happy_path_poe(poe_env: None, audit_log) -> None:
+    switch = FakeSwitch()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert switch.batches == [
+        [
+            f"snmp view wv {ADMIN_COL}.110 excluded",
+            f"snmp view wv {ADMIN_COL}.124 excluded",
+            f"snmp view wv {POE_COL}.1.10 excluded",
+            f"snmp view wv {POE_COL}.1.24 excluded",
+        ],
+        [f"snmp view wv {POE_COL} included"],
+    ]
+    # Both stages run with error_pattern so netmiko stops at a "%" line.
+    assert [kw.get("error_pattern") for kw in switch.kwargs] == ["%", "%"]
+    assert result.startswith("Configuration sent:")
+    assert f"Read-back check: write view wv includes only {POE_COL} and excludes" in result
+
+
+def test_write_view_two_stage_happy_path_admin(audit_log) -> None:
+    switch = FakeSwitch()
+    result = _run_on(switch, "snmp_write_view_create", "ifmib_w", "ifAdminStatus")
+    assert switch.batches == [
+        [
+            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.124 excluded",
+            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.125 excluded",
+        ],
+        ["snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7 included"],
+    ]
+    assert (
+        "Read-back check: write view ifmib_w includes only 1.3.6.1.2.1.2.2.1.7 "
+        "and excludes" in result
+    )
+
+
+def test_write_view_adds_column_without_resending_present_exclusions(poe_env: None) -> None:
+    switch = FakeSwitch(views=[("iso", "1", "included"), *_ADMIN_WV])
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAlias")
+    assert switch.batches == [[f"snmp view wv {ALIAS_COL} included"]]
+    assert result.startswith("Configuration sent:")
+
+
+def test_write_view_adding_poe_to_bound_view_sends_only_poe_exclusions(poe_env: None) -> None:
+    switch = FakeSwitch(views=[("iso", "1", "included"), *_ADMIN_WV])
+    _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert switch.batches == [
+        [f"snmp view wv {POE_COL}.1.10 excluded", f"snmp view wv {POE_COL}.1.24 excluded"],
+        [f"snmp view wv {POE_COL} included"],
+    ]
+
+
+def test_write_view_column_on_poe_view_keeps_poe_exclusions(poe_env: None) -> None:
+    views = [
+        ("iso", "1", "included"),
+        *_ADMIN_WV,
+        ("wv", f"{POE_COL}.1.10", "excluded"),
+        ("wv", f"{POE_COL}.1.24", "excluded"),
+        ("wv", POE_COL, "included"),
+    ]
+    switch = FakeSwitch(views=views)
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAlias")
+    assert switch.batches == [[f"snmp view wv {ALIAS_COL} included"]]
+    assert f"{POE_COL}.1.24" in result
+
+
+def test_write_view_nothing_to_send_when_complete(poe_env: None) -> None:
+    switch = FakeSwitch(views=[("iso", "1", "included"), *_ADMIN_WV])
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert switch.batches == []
+    assert result.startswith("Nothing to send")
+
+
+# --- two-stage apply: abort before the include, rollback ------------------
+
+
+def test_r7_4b_refused_exclusions_abort_before_include(poe_env: None) -> None:
+    """r7.py 4b: every exclusion gets "% Invalid input"; the include must never go out."""
+    switch = FakeSwitch(refuse=lambda cmd: cmd.endswith(" excluded"))
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert not any(cmd.endswith(" included") for cmd in switch.sent)
+    assert result.startswith("Error: Exclusions were not applied")
+    assert f"the included column {POE_COL} was NOT sent" in result
+    assert "Rolled back" in result
+    assert switch.snapshot() == before
+
+
+def test_r7b_silent_exclusion_drop_aborts_before_include(poe_env: None) -> None:
+    """r7b.py: exclusions echo fine but are not installed (no "%" text)."""
+    switch = FakeSwitch(silent_drop=lambda cmd: cmd.endswith(" excluded"))
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert not any(cmd.endswith(" included") for cmd in switch.sent)
+    assert "exclusion(s) missing in show snmp viewtree" in result
+    assert "Rolled back" in result
+    assert switch.snapshot() == before
+    assert _wv_entries(switch) == []
+
+
+def test_r7b_already_bound_view_silent_drop_keeps_previous_state(poe_env: None) -> None:
+    """r7b.py second case: pre-existing exclusions must survive the rollback."""
+    switch = FakeSwitch(
+        views=[("iso", "1", "included"), *_ADMIN_WV],
+        silent_drop=lambda cmd: cmd.endswith(" excluded"),
+    )
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert result.startswith("Error: Exclusions were not applied")
+    assert not any(cmd.endswith(" included") for cmd in switch.sent)
+    # Only this call's PoE exclusions are rolled back, never the old ones.
+    assert not any(f"{ADMIN_COL}." in cmd and cmd.startswith("no ") for cmd in switch.sent)
+    assert switch.snapshot() == before
+
+
+def test_partial_exclusion_failure_rolls_back_the_ones_already_set(poe_env: None) -> None:
+    """Redy: the first exclusion lands, the second is refused -> undo the first."""
+    switch = FakeSwitch(refuse=lambda cmd: cmd == f"snmp view wv {ADMIN_COL}.124 excluded")
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    # netmiko stopped at the refused line: the PoE exclusions were never sent.
+    assert switch.batches[0] == [
+        f"snmp view wv {ADMIN_COL}.110 excluded",
+        f"snmp view wv {ADMIN_COL}.124 excluded",
+    ]
+    assert f"no snmp view wv {ADMIN_COL}.110" in switch.sent
+    assert not any(cmd.endswith(" included") for cmd in switch.sent)
+    assert "Rolled back" in result
+    assert switch.snapshot() == before
+
+
+def test_r7_4c_include_error_rolls_back_include_and_exclusions(poe_env: None) -> None:
+    """r7.py 4c: the include line is refused -> remove it and this call's exclusions."""
+    switch = FakeSwitch(refuse=lambda cmd: cmd.endswith(" included"))
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert result.startswith("Error: Configuration was sent, verification failed:")
+    rollback = switch.batches[-1]
+    assert rollback[0] == f"no snmp view wv {POE_COL}"  # include goes first
+    assert set(rollback[1:]) == {
+        f"no snmp view wv {oid}" for oid in LIVE_ADMIN_EXCL + LIVE_POE_EXCL
+    }
+    assert "Rolled back" in result
+    assert switch.snapshot() == before
+
+
+def test_include_silently_dropped_is_verification_failure_with_rollback(poe_env: None) -> None:
+    switch = FakeSwitch(silent_drop=lambda cmd: cmd.endswith(" included"))
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert result.startswith("Error: Configuration was sent, verification failed:")
+    assert "Rolled back" in result
+    assert switch.snapshot() == before
+
+
+def test_include_readback_with_lost_exclusion_rolls_back(poe_env: None) -> None:
+    """The include lands, but the device then shows one exclusion gone."""
+    switch = FakeSwitch()
+
+    original = switch._apply
+
+    def apply_and_lose(cmd: str) -> None:
+        original(cmd)
+        if cmd.endswith(" included"):
+            switch.views = [v for v in switch.views if v[1] != f"{POE_COL}.1.10"]
+
+    switch._apply = apply_and_lose  # type: ignore[method-assign]
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert result.startswith("Error: Configuration was sent, verification failed:")
+    assert f"pethPsePortAdminEnable exclusion(s) {POE_COL}.1.10" in result
+    # Rollback removed the include; the lost exclusion cannot be removed,
+    # so the end state equals the state before only for the other entries.
+    assert not any(v[2] == "included" and v[0] == "wv" for v in switch.views)
+
+
+def test_rollback_that_cannot_be_verified_is_reported(poe_env: None) -> None:
+    switch = FakeSwitch(
+        refuse=lambda cmd: cmd.endswith(" included") or cmd.startswith("no snmp view")
+    )
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert result.startswith("Error: Configuration was sent, verification failed:")
+    assert "ROLLBACK NOT VERIFIED" in result
+    assert "do not bind a community" in result
+
+
+def test_send_config_passes_error_pattern_to_netmiko() -> None:
+    from netmiko_mcp_linksys.connection import CONFIG_ERROR_PATTERN, _send_config
+
+    switch = FakeSwitch()
+    _send_config(switch, ["snmp view a 1.3.6.1.2.1.2 included"])
+    _send_config(switch, ["snmp view a 1.3.6.1.2.1.31 included"], error_pattern=CONFIG_ERROR_PATTERN)
+    assert "error_pattern" not in switch.kwargs[0]
+    assert switch.kwargs[1]["error_pattern"] == "%"
+    refused = FakeSwitch(refuse=lambda cmd: True)
+    with pytest.raises(ConnectionError):
+        _send_config(
+            refused,
+            ["snmp view a 1.3.6.1.2.1.2 included", "snmp view a 1.3.6.1.2.1.31 included"],
+            error_pattern=CONFIG_ERROR_PATTERN,
+        )
+    assert refused.sent == ["snmp view a 1.3.6.1.2.1.2 included"]
+
+
+# --- central OID normalization and masks ----------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "arcs"),
+    [
+        ("1.3.6.1", (1, 3, 6, 1)),
+        (" 1.3.6.1 ", (1, 3, 6, 1)),
+        (".1.3.6.1", (1, 3, 6, 1)),
+        ("1.3.6.1.", (1, 3, 6, 1)),
+        ("iso.3.6.1", (1, 3, 6, 1)),
+        ("ISO.3.6.1", (1, 3, 6, 1)),
+        (".iso.3.6.1.", (1, 3, 6, 1)),
+        ("iso", (1,)),
+        ("0.0", (0, 0)),
+    ],
+)
+def test_oid_arcs_accepts_known_spellings(raw: str, arcs: tuple[int, ...]) -> None:
+    assert oid_arcs(raw) == arcs
+    assert canonical_oid(raw) == ".".join(map(str, arcs))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["", " ", ".", "..1.3", "1..3", "01.3", "1.03", "+1.3", "-1.3", "1.3 ff",
+     "1.3/ff", "1.3.x", "org.6.1", "iso.iso", "1.3.6.1 mask ff", "\u0661.3"],
+)
+def test_oid_arcs_refuses_unknown_formats(raw: str) -> None:
+    assert oid_arcs(raw) is None
+    assert canonical_oid(raw) is None
+
+
+def test_oid_within_compares_whole_arcs() -> None:
+    assert oid_within("1.3.6.1.2.1.105.1.1.1.3.1.10", POE_COL)
+    assert oid_within(".iso.3.6.1.2.1.105.1.1.1.3.1.10", POE_COL)
+    assert oid_within(POE_COL, POE_COL)
+    assert not oid_within("1.3.6.1.2.1.105", "1.3.6.1.2.1.10")
+    assert not oid_within("1.3.6.1.2.1.2.2.1.70", ADMIN_COL)
+    assert not oid_within("garbage", "1")
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [".{oid}", "iso.{rest}", ".iso.{rest}", " {oid}. "],
+)
+def test_r7_4d_precheck_sees_exclusions_in_any_spelling(spelling: str) -> None:
+    """r7.py 4d / r7b.py: hidden exclusions must not let a whole MIB into a write view."""
+
+    def spell(oid: str) -> str:
+        return spelling.format(oid=oid, rest=oid.split(".", 1)[1])
+
+    switch = FakeSwitch(
+        views=[
+            ("iso", "1", "included"),
+            ("wv", spell(f"{ADMIN_COL}.110"), "excluded"),
+            ("wv", spell(f"{ADMIN_COL}.124"), "excluded"),
+            ("wv", ADMIN_COL, "included"),
+        ]
+    )
+    result = _run_on(switch, "snmp_view_create", "wv", "power-ethernet")
+    assert result.startswith("Rejected:")
+    assert "so it is a write view" in result
+    assert switch.batches == []
+
+
+def test_precheck_sees_writable_column_without_exclusions() -> None:
+    switch = FakeSwitch(views=[("iso", "1", "included"), ("wv", f"iso.{POE_COL[2:]}", "included")])
+    result = _run_on(switch, "snmp_view_create", "wv", "interfaces")
+    assert result.startswith("Rejected:")
+    assert switch.batches == []
+
+
+def test_precheck_refuses_unparseable_oid_in_view() -> None:
+    switch = FakeSwitch(views=[("iso", "1", "included"), ("rv", "ifTable", "included")])
+    result = _run_on(switch, "snmp_view_create", "rv", "power-ethernet")
+    assert result.startswith("Rejected:")
+    assert "unrecognised OID format" in result
+    assert switch.batches == []
+
+
+@pytest.mark.parametrize("mask", ["ff:00", "fe", "1.0.1", "7f", "0"])
+def test_precheck_read_view_refuses_partial_mask(mask: str) -> None:
+    """Redy: a wildcard mask is never safe, in the read-view precheck either."""
+    switch = FakeSwitch()
+    switch.views.append(("rv", "1.3.6.1.2.1.2", "included", mask))
+    result = _run_on(switch, "snmp_view_create", "rv", "power-ethernet")
+    assert result.startswith("Rejected:")
+    assert "unrecognised mask" in result
+    assert switch.batches == []
+
+
+@pytest.mark.parametrize("mask", ["", "ff", "1.1.1", "FF:FF"])
+def test_precheck_read_view_accepts_exact_mask(mask: str) -> None:
+    switch = FakeSwitch()
+    switch.views.append(("rv", "1.3.6.1.2.1.2", "included", mask))
+    result = _run_on(switch, "snmp_view_create", "rv", "power-ethernet")
+    assert result.startswith("Configuration sent:"), result
+
+
+@pytest.mark.parametrize("mask", ["ff:00", "fe"])
+def test_write_view_target_refuses_partial_mask(poe_env: None, mask: str) -> None:
+    switch = FakeSwitch()
+    switch.views.append(("wv", f"{ADMIN_COL}.110", "excluded", mask))
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert result.startswith("Rejected:")
+    assert "unrecognised mask" in result
+    assert switch.batches == []
+
+
+def test_masked_exclusion_does_not_count_in_write_view_check(poe_env: None) -> None:
+    listing = _views(
+        _view_block("wv", f"{ADMIN_COL}.110", "excluded", mask="ff:00"),
+        _view_block("wv", f"{ADMIN_COL}.124", "excluded"),
+        _view_block("wv", ADMIN_COL, "included"),
+    )
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "wv", LIVE_ADMIN_EXCL)
+    assert not ok
+    assert "unrecognised mask" in note
+
+
+@pytest.mark.parametrize(
+    "spelling", ["iso.3.6.1.2.1.105", ".1.3.6.1.2.1.105", "1.3.6.1.2.1.105."]
+)
+def test_whole_poe_mib_in_any_spelling_is_not_write_safe(poe_env: None, spelling: str) -> None:
+    listing = _views(
+        *(_view_block("wv", oid, "excluded") for oid in LIVE_ADMIN_EXCL + LIVE_POE_EXCL),
+        _view_block("wv", spelling, "included"),
+    )
+    ok, note = view_is_write_safe(
+        parse_snmp_viewtree(listing), "wv", LIVE_ADMIN_EXCL + LIVE_POE_EXCL
+    )
+    assert not ok
+    assert "whole POWER-ETHERNET-MIB" in note
+
+
+def test_exclusions_in_other_spelling_count_in_write_view_check(poe_env: None) -> None:
+    listing = _views(
+        _view_block("wv", f".{ADMIN_COL}.110", "excluded"),
+        _view_block("wv", f"iso.{ADMIN_COL[2:]}.124", "excluded"),
+        _view_block("wv", f"{ADMIN_COL}.", "included"),
+    )
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "wv", LIVE_ADMIN_EXCL)
+    assert ok, note
+
+
+def test_read_view_restricted_check_normalizes_and_refuses_unknown() -> None:
+    ok, _ = view_is_restricted(
+        parse_snmp_viewtree(_view_block("rv", "iso.3.6.1.2.1.105", "included")), "rv"
+    )
+    assert ok
+    ok, note = view_is_restricted(
+        parse_snmp_viewtree(_view_block("rv", ".iso", "included")), "rv"
+    )
+    assert not ok and "broad subtree" in note
+    ok, note = view_is_restricted(
+        parse_snmp_viewtree(_view_block("rv", "mib-2.105", "included")), "rv"
+    )
+    assert not ok and "unrecognised OID format" in note
+
+
+def test_snmp_view_create_readback_matches_normalized_oid() -> None:
+    switch = FakeSwitch()
+    original = switch._apply
+
+    def apply_dotted(cmd: str) -> None:
+        original(cmd)
+        name, oid, typ, mask = switch.views[-1]
+        switch.views[-1] = (name, "." + oid, typ, mask)
+
+    switch._apply = apply_dotted  # type: ignore[method-assign]
+    result = _run_on(switch, "snmp_view_create", "rv", "power-ethernet")
+    assert "Read-back check: view rv includes 1.3.6.1.2.1.105." in result

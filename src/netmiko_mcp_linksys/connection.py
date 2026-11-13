@@ -442,13 +442,25 @@ def run_shows(commands: list[str]) -> dict[str, str]:
         return {command: send_paged_redacted(conn, command) for command in commands}
 
 
-def _send_config(conn: Any, commands: list[str]) -> str:
+# A CLI error line on ISS starts with "%" ("% Invalid input", "% Error").
+CONFIG_ERROR_PATTERN = r"%"
+
+
+def _send_config(
+    conn: Any, commands: list[str], *, error_pattern: str | None = None
+) -> str:
+    """Send a config set. With ``error_pattern``, netmiko stops at the first
+    command whose output matches it, so later commands are never sent."""
+    kwargs: dict[str, Any] = {}
+    if error_pattern is not None:
+        kwargs["error_pattern"] = error_pattern
     try:
         output = conn.send_config_set(
             commands,
             exit_config_mode=True,
             cmd_verify=True,
             read_timeout=read_timeout(),
+            **kwargs,
         )
     except Exception as exc:
         if _commands_include_snmp_community(commands):
