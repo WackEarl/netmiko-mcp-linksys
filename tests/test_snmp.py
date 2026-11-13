@@ -39,17 +39,16 @@ from netmiko_mcp_linksys.snmp_cli import (
     parse_snmp_group,
     parse_snmp_user,
     parse_snmp_viewtree,
-    protected_admin_status_oids,
     redact_community_listing,
     resolve_removable_community_name,
     security_name_for_view,
     user_present,
+    view_entry_problem,
     view_is_restricted,
     view_is_write_safe,
 )
 from netmiko_mcp_linksys.validation import (
     ValidationError,
-    parse_protected_ifindexes,
     redact_secrets,
     validate_community_remove_name,
     validate_snmp_access,
@@ -110,20 +109,6 @@ View Name: ifmib_w
 Subtree OID: 1.3.6.1.2.1.2.2.1.7
 Subtree Mask:
 View Type: included
-Storage Type: nonVolatile
-Row Status: active
-------------------------------
-View Name: ifmib_w
-Subtree OID: 1.3.6.1.2.1.2.2.1.7.124
-Subtree Mask:
-View Type: excluded
-Storage Type: nonVolatile
-Row Status: active
-------------------------------
-View Name: ifmib_w
-Subtree OID: 1.3.6.1.2.1.2.2.1.7.125
-Subtree Mask:
-View Type: excluded
 Storage Type: nonVolatile
 Row Status: active
 """
@@ -189,15 +174,6 @@ def enable_snmp_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SWITCH_SNMP_WRITE_ENABLED", "1")
 
 
-# Dummy ifIndex values for the conftest SWITCH_PROTECTED_PORTS (0/24,0/25).
-# Deliberately not the port numbers: the real mapping is verified live.
-IFINDEX_ENV = "0/24=124,0/25=125"
-EXCLUDED_OIDS = ["1.3.6.1.2.1.2.2.1.7.124", "1.3.6.1.2.1.2.2.1.7.125"]
-
-
-@pytest.fixture(autouse=True)
-def protected_ifindexes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", IFINDEX_ENV)
 
 
 @pytest.fixture
@@ -537,7 +513,7 @@ def _fake_snmp_session(
     def exec_cmd(_conn: Any, command: str) -> str:
         return shows(command) if callable(shows) else shows[command]
 
-    def send(_conn: Any, commands: list[str]) -> str:
+    def send(_conn: Any, commands: list[str], **_kwargs: Any) -> str:
         sent_log.append(list(commands))
         return "ok"
 
@@ -1512,9 +1488,16 @@ def test_cody_show_snmp_community_listing_keeps_hash_and_gt_headers(
 
 
 # ---------------------------------------------------------------------------
-# Write-view hardening (Redy): ifAdminStatus exclusions for protected ports,
-# POWER-ETHERNET-MIB only in the read view, separate read/write views.
+# Write views (Task 48; simplified on Roland's decision of 2026-11-13): a
+# write view holds only the columns ifAdminStatus, ifAlias and
+# pethPsePortAdminEnable. There are no per-port exclusions any more; the
+# protected ports are refused by the port tools only (SWITCH_PROTECTED_PORTS).
 # ---------------------------------------------------------------------------
+
+POE_COL = "1.3.6.1.2.1.105.1.1.1.3"
+ADMIN_COL = "1.3.6.1.2.1.2.2.1.7"
+ALIAS_COL = "1.3.6.1.2.1.31.1.1.1.18"
+
 
 def _view_block(name: str, oid: str, view_type: str, mask: str = "") -> str:
     return (
@@ -1528,81 +1511,36 @@ def _views(*blocks: str) -> str:
 
 
 WRITE_VIEW_OK = _views(
-    _view_block("ifmib_w", "1.3.6.1.2.1.2.2.1.7", "included"),
-    _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
-    _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
+    _view_block("ifmib_w", ADMIN_COL, "included"),
+    _view_block("ifmib_w", POE_COL, "included"),
 )
 
 
-def test_ifindex_env_valid_mapping() -> None:
-    assert parse_protected_ifindexes() == {"0/24": "124", "0/25": "125"}
-    assert parse_protected_ifindexes(" 0/25 = 125 , 0/24=124 ") == {
-        "0/25": "125",
-        "0/24": "124",
-    }
-    assert protected_admin_status_oids({"0/24": "124", "0/25": "9"}) == [
-        "1.3.6.1.2.1.2.2.1.7.9",
-        "1.3.6.1.2.1.2.2.1.7.124",
+def _read_view_ifmib() -> str:
+    return _views(
+        _view_block("ifmib", "1.3.6.1.2.1.2", "included"),
+        _view_block("ifmib", "1.3.6.1.2.1.31", "included"),
+        _view_block("ifmib", "1.3.6.1.2.1.105", "included"),
+    )
+
+
+def test_write_view_command_is_one_include() -> None:
+    assert build_write_view_commands("ifmib_w", ADMIN_COL) == [
+        f"snmp view ifmib_w {ADMIN_COL} included"
     ]
-
-
-@pytest.mark.parametrize(
-    ("raw", "message"),
-    [
-        ("", "is empty"),
-        (" , ", "is empty"),
-        ("0/24,0/25=125", "invalid entry"),
-        ("0/24=0,0/25=125", "invalid entry"),
-        ("0/24=0124,0/25=125", "invalid entry"),
-        ("0/24=-1,0/25=125", "invalid entry"),
-        ("0/24=abc,0/25=125", "invalid entry"),
-        ("0/24=2147483648,0/25=125", "invalid entry"),
-        ("0/24=1.2,0/25=125", "invalid entry"),
-        ("0/99=1,0/25=125", "invalid entry"),
-        ("0/24=124,0/24=125", "more than once"),
-        ("0/24=124,0/25=124", "same ifIndex"),
-        ("0/24=124", "missing protected port(s) 0/25"),
-        ("0/24=124,0/25=125,0/10=110", "not in SWITCH_PROTECTED_PORTS 0/10"),
-    ],
-)
-def test_ifindex_env_rejects_bad_values(raw: str, message: str) -> None:
-    with pytest.raises(ValidationError, match=__import__("re").escape(message)):
-        parse_protected_ifindexes(raw)
-
-
-def test_ifindex_env_unset_or_protected_ports_unset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
-    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_IFINDEXES is not set"):
-        parse_protected_ifindexes()
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", IFINDEX_ENV)
-    monkeypatch.delenv("SWITCH_PROTECTED_PORTS")
-    with pytest.raises(ValidationError, match="SWITCH_PROTECTED_PORTS is not set"):
-        parse_protected_ifindexes()
-
-
-def test_write_view_commands_send_exclusions_first() -> None:
-    cmds = build_write_view_commands("ifmib_w", "1.3.6.1.2.1.2", EXCLUDED_OIDS)
-    assert cmds == [
-        "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.124 excluded",
-        "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.125 excluded",
-        "snmp view ifmib_w 1.3.6.1.2.1.2 included",
+    assert build_write_view_commands("ifmib_w", POE_COL) == [
+        f"snmp view ifmib_w {POE_COL} included"
     ]
-    with pytest.raises(ValidationError, match="No ifAdminStatus exclusions"):
-        build_write_view_commands("ifmib_w", "1.3.6.1.2.1.2", [])
 
 
 def test_write_subtrees_are_columns_only() -> None:
-    assert normalize_write_subtree("ifAdminStatus") == "1.3.6.1.2.1.2.2.1.7"
-    assert normalize_write_subtree("ifadminstatus") == "1.3.6.1.2.1.2.2.1.7"
-    assert normalize_write_subtree("1.3.6.1.2.1.2.2.1.7") == "1.3.6.1.2.1.2.2.1.7"
-    assert normalize_write_subtree("ifAlias") == "1.3.6.1.2.1.31.1.1.1.18"
-    assert normalize_write_subtree(" 1.3.6.1.2.1.31.1.1.1.18 ") == "1.3.6.1.2.1.31.1.1.1.18"
-    assert (
-        normalize_write_subtree("pethPsePortAdminEnable") == "1.3.6.1.2.1.105.1.1.1.3"
-    )
-    assert normalize_write_subtree("1.3.6.1.2.1.105.1.1.1.3") == "1.3.6.1.2.1.105.1.1.1.3"
+    assert normalize_write_subtree("ifAdminStatus") == ADMIN_COL
+    assert normalize_write_subtree("ifadminstatus") == ADMIN_COL
+    assert normalize_write_subtree(ADMIN_COL) == ADMIN_COL
+    assert normalize_write_subtree("ifAlias") == ALIAS_COL
+    assert normalize_write_subtree(f" {ALIAS_COL} ") == ALIAS_COL
+    assert normalize_write_subtree("pethPsePortAdminEnable") == POE_COL
+    assert normalize_write_subtree(POE_COL) == POE_COL
     for bad in (
         "power-ethernet",
         "POWER-ETHERNET-MIB",
@@ -1612,10 +1550,10 @@ def test_write_subtrees_are_columns_only() -> None:
         "ifmib",
         "1.3.6.1.2.1.31",
         # Instances and other columns are not write subtrees either.
-        "1.3.6.1.2.1.2.2.1.7.10",
-        "1.3.6.1.2.1.105.1.1.1.3.1.10",
+        f"{ADMIN_COL}.10",
+        f"{POE_COL}.1.10",
         "1.3.6.1.2.1.105.1.1.1.4",
-        ".1.3.6.1.2.1.2.2.1.7",
+        f".{ADMIN_COL}",
         "1",
         "",
     ):
@@ -1634,93 +1572,235 @@ def test_community_commands_require_split_views() -> None:
     assert cmds[1] == "snmp access ifmib_grp v2c read ifmib write ifmib_w notify none"
 
 
-def test_mask_is_exact() -> None:
+def test_protected_index_envs_are_gone() -> None:
+    """The view-level port exclusions and their envs were removed on purpose."""
+    import netmiko_mcp_linksys.snmp_cli as cli
+    import netmiko_mcp_linksys.validation as val
+
+    for module in (cli, val):
+        for name in (
+            "parse_protected_ifindexes",
+            "parse_protected_poe_indexes",
+            "required_write_exclusions",
+            "required_poe_exclusions",
+            "write_view_exclusions",
+        ):
+            assert not hasattr(module, name), name
+
+
+# --- masks -----------------------------------------------------------------
+
+
+def test_mask_is_exact_without_oid() -> None:
     for mask in ("", " ", "-", "none", "1", "1.1.1.1", "ff", "FF:FF", "0xff", "ff ff"):
         assert mask_is_exact(mask), mask
-    for mask in ("0", "1.0.1", "fe", "7f", "ff:00", "1.1.0", "?"):
+    for mask in ("0", "1.0.1", "fe", "7f", "ff:00", "1.1.0", "?", "fff", "1.2"):
         assert not mask_is_exact(mask), mask
 
 
-def test_view_is_write_safe_accepts_complete_write_view() -> None:
-    ok, note = view_is_write_safe(
-        parse_snmp_viewtree(WRITE_VIEW_OK), "ifmib_w", EXCLUDED_OIDS
+@pytest.mark.parametrize(
+    ("mask", "oid"),
+    [
+        # Redy's read check: the switch prints "Subtree Mask : 1" for OID 1.
+        ("1", "1"),
+        # Short masks are extended with ones (RFC 3415).
+        ("1", ADMIN_COL),
+        ("1.1.1", POE_COL),
+        ("1.1.1.1.1.1.1.1.1", ADMIN_COL),
+        # Hex: bits beyond the OID length do not matter (full masks).
+        ("fe", "1.3.6.1.2.1.2"),  # 7 arcs
+        ("ff:80", "1.3.6.1.2.1.2.2.1"),  # 9 arcs
+        ("ff:c0", "1.3.6.1.2.1.31.1.1.1"),  # 10 arcs
+        ("ff:e0", POE_COL),  # 11 arcs
+        ("ff:ff:ff", POE_COL),
+        ("0xffe0", POE_COL),
+        ("FF E0", POE_COL),
+        ("1.1.1.1.1.1.1.1.1.1.1.0", POE_COL),  # 12th bit is beyond the OID
+    ],
+)
+def test_full_mask_for_oid_is_exact(mask: str, oid: str) -> None:
+    assert mask_is_exact(mask, oid)
+
+
+@pytest.mark.parametrize(
+    ("mask", "oid"),
+    [
+        ("0", "1"),
+        ("1.0", ADMIN_COL),
+        ("fe", "1.3.6.1.2.1.2.2"),  # 8 arcs, 8th bit 0 -> wildcard
+        ("ff:7f", ADMIN_COL),
+        ("ff:c0", POE_COL),  # 11th bit 0
+        ("ff:80", "1.3.6.1.2.1.31.1.1.1"),  # 10th bit 0
+        ("?", ADMIN_COL),
+        ("ff", "not an oid"),
+    ],
+)
+def test_partial_mask_for_oid_is_wildcard(mask: str, oid: str) -> None:
+    assert not mask_is_exact(mask, oid)
+
+
+# --- Redy's live viewtree format (read-only check) --------------------------
+
+REDY_VIEWTREE = """\
+View Name    : iso
+Subtree OID  : 1
+Subtree Mask : 1
+View Type    : Included
+Storage Type : Non-volatile
+Row Status   : Active
+------------------------------
+View Name    : restricted
+Subtree OID  : 1
+Subtree Mask : 1
+View Type    : Included
+Storage Type : Non-volatile
+Row Status   : Active
+"""
+
+
+def test_parse_redy_viewtree_format() -> None:
+    entries = parse_snmp_viewtree(REDY_VIEWTREE)
+    assert [(e.name, e.oid, e.mask, e.view_type) for e in entries] == [
+        ("iso", "1", "1", "included"),
+        ("restricted", "1", "1", "included"),
+    ]
+    for name in ("iso", "restricted"):
+        assert view_entry_problem(entries, name) is None
+    # The views cover the whole tree: never accepted as restricted access.
+    ok, note = view_is_restricted(entries, "iso")
+    assert not ok and "broad subtree 1" in note
+
+
+def test_parse_redy_viewtree_blank_line_separated() -> None:
+    """Blocks split only by blank lines are still separate entries."""
+    listing = REDY_VIEWTREE.replace("------------------------------\n", "\n")
+    entries = parse_snmp_viewtree(listing)
+    assert [(e.name, e.oid) for e in entries] == [("iso", "1"), ("restricted", "1")]
+    # Prompt/command echo before the first block does not create entries.
+    echoed = "LGS328PC# show snmp viewtree\n\n" + listing + "\nLGS328PC#"
+    assert [(e.name, e.oid) for e in parse_snmp_viewtree(echoed)] == [
+        ("iso", "1"),
+        ("restricted", "1"),
+    ]
+
+
+def _redy_block(name: str, oid: str, view_type: str, mask: str) -> str:
+    return (
+        f"View Name    : {name}\nSubtree OID  : {oid}\nSubtree Mask : {mask}\n"
+        f"View Type    : {view_type}\nStorage Type : Non-volatile\nRow Status   : Active\n"
     )
+
+
+@pytest.mark.parametrize("mask", ["1", "1.1.1.1.1.1.1.1.1.1.1", "ff:e0", ""])
+def test_write_view_in_redy_format_with_full_mask_is_safe(mask: str) -> None:
+    listing = _views(
+        REDY_VIEWTREE,
+        _redy_block("wv", ADMIN_COL, "Included", mask),
+        _redy_block("wv", POE_COL, "Included", mask),
+    )
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "wv")
     assert ok, note
-    assert "excludes 1.3.6.1.2.1.2.2.1.7.124, 1.3.6.1.2.1.2.2.1.7.125" in note
+    assert note == f"write view wv includes only {ADMIN_COL}, {POE_COL}"
+
+
+def test_write_view_in_redy_format_with_wildcard_mask_is_refused() -> None:
+    listing = _views(REDY_VIEWTREE, _redy_block("wv", POE_COL, "Included", "ff:c0"))
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "wv")
+    assert not ok
+    assert "unrecognised mask" in note
+
+
+# --- view_is_write_safe ------------------------------------------------------
+
+
+def test_view_is_write_safe_accepts_columns_only() -> None:
+    ok, note = view_is_write_safe(parse_snmp_viewtree(WRITE_VIEW_OK), "ifmib_w")
+    assert ok, note
+    assert note == f"write view ifmib_w includes only {ADMIN_COL}, {POE_COL}"
+
+
+def test_view_is_write_safe_tolerates_old_exclusions() -> None:
+    """Exclusions from older builds only narrow the view; they are not required."""
+    listing = _views(WRITE_VIEW_OK, _view_block("ifmib_w", f"{ADMIN_COL}.124", "excluded"))
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "ifmib_w")
+    assert ok, note
 
 
 @pytest.mark.parametrize(
     ("listing", "message"),
     [
-        (
-            _views(
-                _view_block("ifmib_w", "1.3.6.1.2.1.2.2.1.7", "included"),
-                _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
-            ),
-            "missing the ifAdminStatus exclusion(s) 1.3.6.1.2.1.2.2.1.7.125",
-        ),
-        (
-            WRITE_VIEW_OK + "------------------------------\n"
-            + _view_block("ifmib_w", "1.3.6.1.2.1.105", "included"),
-            "POWER-ETHERNET-MIB",
-        ),
-        (
-            WRITE_VIEW_OK + "------------------------------\n"
-            + _view_block("ifmib_w", "1", "included"),
-            "not allowed in a write view",
-        ),
-        (
-            _views(
-                _view_block("ifmib_w", "1.3.6.1.2.1.2.2.1.7", "included"),
-                _view_block("ifmib_w", EXCLUDED_OIDS[0], ""),
-                _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
-            ),
-            "included/excluded type",
-        ),
-        (
-            _views(
-                _view_block("ifmib_w", "1.3.6.1.2.1.2.2.1.7", "included"),
-                _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded", mask="ff:ff:00"),
-                _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
-            ),
-            "unrecognised mask",
-        ),
-        (
-            # Exclusions written as "included" do not count.
-            _views(
-                _view_block("ifmib_w", "1.3.6.1.2.1.2.2.1.7", "included"),
-                _view_block("ifmib_w", EXCLUDED_OIDS[0], "included"),
-                _view_block("ifmib_w", EXCLUDED_OIDS[1], "included"),
-            ),
-            "not allowed in a write view",
-        ),
-        (
-            _views(
-                _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
-                _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
-            ),
-            "no included subtrees",
-        ),
+        (_views(WRITE_VIEW_OK, _view_block("ifmib_w", "1.3.6.1.2.1.105", "included")),
+         "whole POWER-ETHERNET-MIB"),
+        (_views(WRITE_VIEW_OK, _view_block("ifmib_w", "1", "included")),
+         "not allowed in a write view"),
+        (_views(WRITE_VIEW_OK, _view_block("ifmib_w", "1.3.6.1.2.1.2", "included")),
+         "includes subtree 1.3.6.1.2.1.2, which is not allowed"),
+        # An instance written as "included" is not a column.
+        (_views(WRITE_VIEW_OK, _view_block("ifmib_w", f"{POE_COL}.1.10", "included")),
+         "not allowed in a write view"),
+        (_views(WRITE_VIEW_OK, _view_block("ifmib_w", f"{ADMIN_COL}.124", "")),
+         "included/excluded type"),
+        (_view_block("ifmib_w", ADMIN_COL, "included", mask="ff:7f"), "unrecognised mask"),
+        (_view_block("ifmib_w", f"{ADMIN_COL}.124", "excluded"), "no included subtrees"),
+        (_view_block("ifmib_w", "ifTable", "included"), "unrecognised OID format"),
         (VIEW_SHOW_RESTRICTED.replace("ifmib_w", "other"), "was not found"),
     ],
 )
 def test_view_is_write_safe_rejects(listing: str, message: str) -> None:
-    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "ifmib_w", EXCLUDED_OIDS)
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "ifmib_w")
     assert not ok
     assert message in note
 
 
-def test_view_is_write_safe_without_exclusions_refuses() -> None:
-    ok, note = view_is_write_safe(parse_snmp_viewtree(WRITE_VIEW_OK), "ifmib_w", [])
+@pytest.mark.parametrize(
+    "spelling", ["iso.3.6.1.2.1.105", ".1.3.6.1.2.1.105", "1.3.6.1.2.1.105."]
+)
+def test_whole_poe_mib_in_any_spelling_is_not_write_safe(spelling: str) -> None:
+    listing = _views(WRITE_VIEW_OK, _view_block("ifmib_w", spelling, "included"))
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "ifmib_w")
     assert not ok
-    assert "no ifAdminStatus exclusions configured" in note
+    assert "whole POWER-ETHERNET-MIB" in note
+
+
+def test_columns_in_other_spelling_are_write_safe() -> None:
+    listing = _views(
+        _view_block("wv", f".{ADMIN_COL}", "included"),
+        _view_block("wv", f"iso.{POE_COL[2:]}.", "included"),
+    )
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "wv")
+    assert ok, note
 
 
 def test_read_view_with_wildcard_mask_is_not_restricted() -> None:
-    listing = _view_block("ifmib", "1.3.6.1.2.1.2", "included", mask="ff:00")
+    listing = _view_block("ifmib", "1.3.6.1.2.1.2", "included", mask="ff:00:01")
+    ok, note = view_is_restricted(parse_snmp_viewtree(listing), "ifmib")
+    assert ok, note  # bits beyond the 7 arcs do not matter
+    listing = _view_block("ifmib", "1.3.6.1.2.1.2", "included", mask="fc")
     ok, note = view_is_restricted(parse_snmp_viewtree(listing), "ifmib")
     assert not ok
     assert "unrecognised mask" in note
+
+
+def test_read_view_restricted_check_normalizes_and_refuses_unknown() -> None:
+    ok, _ = view_is_restricted(
+        parse_snmp_viewtree(_view_block("rv", "iso.3.6.1.2.1.105", "included")), "rv"
+    )
+    assert ok
+    ok, note = view_is_restricted(
+        parse_snmp_viewtree(_view_block("rv", ".1", "included")), "rv"
+    )
+    assert not ok and "broad subtree" in note
+    ok, note = view_is_restricted(
+        parse_snmp_viewtree(_view_block("rv", ".iso", "included")), "rv"
+    )
+    assert not ok and "unrecognised OID format" in note
+    ok, note = view_is_restricted(
+        parse_snmp_viewtree(_view_block("rv", "mib-2.105", "included")), "rv"
+    )
+    assert not ok and "unrecognised OID format" in note
+
+
+# --- assert_configured_community_ready ---------------------------------------
 
 
 def _ready(access: str, views: str, **kwargs: Any) -> str:
@@ -1734,7 +1814,7 @@ def _ready(access: str, views: str, **kwargs: Any) -> str:
     )
 
 
-def test_ready_verifies_split_and_exclusions(community_env: str) -> None:
+def test_ready_verifies_split(community_env: str) -> None:
     status = _ready(
         ACCESS_SHOW_RW,
         VIEW_SHOW_WITH_POE,
@@ -1743,24 +1823,11 @@ def test_ready_verifies_split_and_exclusions(community_env: str) -> None:
     )
     assert "read view ifmib includes only allow-listed subtrees" in status
     assert "1.3.6.1.2.1.105" in status  # PoE in the read view is fine
-    assert "write view ifmib_w includes only 1.3.6.1.2.1.2" in status
-    assert "excludes 1.3.6.1.2.1.2.2.1.7.124" in status
+    assert f"write view ifmib_w includes only {ADMIN_COL}" in status
     assert SECRET not in status
 
 
-def test_ready_refuses_rw_without_ifindex_env(
-    community_env: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
-    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_IFINDEXES") as exc:
-        _ready(ACCESS_SHOW_RW, VIEW_SHOW_RESTRICTED)
-    assert SECRET not in str(exc.value)
-
-
-def test_ready_ro_community_does_not_need_ifindex_env(
-    community_env: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+def test_ready_ro_community(community_env: str) -> None:
     ro = ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: none")
     status = _ready(ro, VIEW_SHOW_RESTRICTED, expected_read_view="ifmib")
     assert "read-only" in status
@@ -1772,20 +1839,10 @@ def test_ready_refuses_same_read_and_write_view(community_env: str) -> None:
         _ready(same, VIEW_SHOW_RESTRICTED)
 
 
-def test_ready_refuses_write_view_with_poe(community_env: str) -> None:
-    poe = VIEW_SHOW_RESTRICTED + "------------------------------\n" + _view_block(
-        "ifmib_w", "1.3.6.1.2.1.105", "included"
-    )
+def test_ready_refuses_write_view_with_poe_mib(community_env: str) -> None:
+    poe = _views(VIEW_SHOW_RESTRICTED, _view_block("ifmib_w", "1.3.6.1.2.1.105", "included"))
     with pytest.raises(ValidationError, match="POWER-ETHERNET-MIB"):
         _ready(ACCESS_SHOW_RW, poe)
-
-
-def test_ready_refuses_write_view_missing_exclusion(community_env: str) -> None:
-    missing = VIEW_SHOW_RESTRICTED.replace(
-        "Subtree OID: 1.3.6.1.2.1.2.2.1.7.125", "Subtree OID: 1.3.6.1.2.1.2.2.1.7.126"
-    )
-    with pytest.raises(ValidationError, match=r"missing the ifAdminStatus exclusion"):
-        _ready(ACCESS_SHOW_RW, missing)
 
 
 def test_ready_expected_views_are_exact(community_env: str) -> None:
@@ -1805,6 +1862,9 @@ def test_ready_expected_views_are_exact(community_env: str) -> None:
             expected_read_view="IFMIB",
             expected_write_view="ifmib_w",
         )
+
+
+# --- tools: prechecks before anything is sent --------------------------------
 
 
 def _rw_listing(new_view: str) -> dict[str, str]:
@@ -1830,17 +1890,28 @@ def test_snmp_write_view_create_refuses_whole_subtrees(subtree: str) -> None:
     assert "not allowed in a write view" in result
 
 
-def test_snmp_write_view_create_refuses_without_ifindexes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_snmp_write_view_create_needs_no_index_envs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No SWITCH_SNMP_PROTECTED_* env is read; a stale one changes nothing."""
+    for name in ("SWITCH_SNMP_PROTECTED_IFINDEXES", "SWITCH_SNMP_PROTECTED_POE_INDEXES"):
+        monkeypatch.delenv(name, raising=False)
+    switch = FakeSwitch()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert result.startswith("Configuration sent:"), result
+    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_POE_INDEXES", "garbage")
+    switch = FakeSwitch()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert result.startswith("Configuration sent:"), result
+
+
+def test_snmp_write_view_create_requires_write_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     from netmiko_mcp_linksys.server import snmp_write_view_create
 
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+    monkeypatch.delenv("SWITCH_SNMP_WRITE_ENABLED")
     with patch("netmiko_mcp_linksys.server.run_in_session") as run:
-        result = snmp_write_view_create("ifmib_w", "ifAdminStatus")
+        result = snmp_write_view_create("ifmib_w", "pethPsePortAdminEnable")
     run.assert_not_called()
     assert result.startswith("Rejected:")
-    assert "SWITCH_SNMP_PROTECTED_IFINDEXES is not set" in result
+    assert "SWITCH_SNMP_WRITE_ENABLED" in result
 
 
 @pytest.mark.parametrize(
@@ -1857,7 +1928,6 @@ def test_snmp_write_view_create_prechecks_before_send(listing: str, message: str
     sent: list[list[str]] = []
     session = _fake_snmp_session({READBACK_SNMP_VIEW: listing}, sent)
     with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
-        # "ifmib" is a read view with whole subtrees, so it cannot become a write view.
         result = snmp_write_view_create("ifmib", "ifAdminStatus")
     assert sent == []
     assert result.startswith("Rejected:")
@@ -1878,29 +1948,37 @@ def test_snmp_view_create_poe_allowed_on_read_view() -> None:
     assert "Read-back check: view ifmib includes 1.3.6.1.2.1.105" in result
 
 
+UNBOUND_ACCESS = ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: none")
+
+
 @pytest.mark.parametrize(
-    ("view", "access", "message"),
+    ("view", "access", "views", "message"),
     [
-        ("ifmib_w", ACCESS_SHOW_RW, "is used as a write view"),
-        ("IFMIB_W", ACCESS_SHOW_RW, "is used as a write view"),
+        ("ifmib_w", ACCESS_SHOW_RW, VIEW_SHOW_RESTRICTED, "is used as a write view"),
+        ("IFMIB_W", ACCESS_SHOW_RW, VIEW_SHOW_RESTRICTED, "is used as a write view"),
+        # Not bound yet, but it holds a writable column.
+        ("ifmib_w", UNBOUND_ACCESS, VIEW_SHOW_RESTRICTED, "so it is a write view"),
+        # Not bound yet, but it holds an excluded entry.
         (
-            # Not bound yet, but it carries ifAdminStatus exclusions.
-            "ifmib_w",
-            ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: none"),
-            "has protected-port exclusions",
+            "pw",
+            UNBOUND_ACCESS,
+            _views(
+                _view_block("pw", "1.3.6.1.2.1.31", "included"),
+                _view_block("pw", f"{POE_COL}.1.10", "excluded"),
+            ),
+            "has an excluded entry",
         ),
-        ("ifmib", "garbage without keys", "Could not parse show snmp group access"),
+        ("ifmib", "garbage without keys", VIEW_SHOW_RESTRICTED,
+         "Could not parse show snmp group access"),
     ],
 )
-def test_snmp_view_create_refuses_poe_in_write_view(
-    view: str, access: str, message: str
+def test_snmp_view_create_refuses_whole_mib_in_write_view(
+    view: str, access: str, views: str, message: str
 ) -> None:
     from netmiko_mcp_linksys.server import snmp_view_create
 
     sent: list[list[str]] = []
-    session = _fake_snmp_session(
-        {READBACK_SNMP_ACCESS: access, READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED}, sent
-    )
+    session = _fake_snmp_session({READBACK_SNMP_ACCESS: access, READBACK_SNMP_VIEW: views}, sent)
     with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
         result = snmp_view_create(view, "power-ethernet")
     assert sent == []
@@ -1922,22 +2000,23 @@ def test_snmp_community_create_rw_split_and_redaction(
     assert sent[0][2] == f"snmp community name {SECRET} security ifmib_sec"
     assert not _secret_in(result, SECRET)
     assert "snmp community name [REDACTED] security ifmib_sec" in result
-    assert "excludes 1.3.6.1.2.1.2.2.1.7.124" in result
+    assert f"write view ifmib_w includes only {ADMIN_COL}" in result
     assert not _secret_in(audit_log.read_text(encoding="utf-8"), SECRET)
 
 
-def test_snmp_community_create_rw_refuses_without_ifindexes(
-    community_env: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_snmp_community_create_rw_with_poe_write_view(community_env: str) -> None:
     from netmiko_mcp_linksys.server import snmp_community_create
 
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
-    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
+    listing = _rw_listing(_views(_read_view_ifmib(), WRITE_VIEW_OK))
+    sent: list[list[str]] = []
+    with patch(
+        "netmiko_mcp_linksys.server.run_in_session",
+        side_effect=_fake_snmp_session(listing, sent),
+    ):
         result = snmp_community_create("ifmib", "rw", "ifmib_w")
-    run.assert_not_called()
-    assert result.startswith("Rejected:")
-    assert "SWITCH_SNMP_PROTECTED_IFINDEXES is not set" in result
-    assert SECRET not in result
+    assert len(sent) == 1
+    assert f"includes only {ADMIN_COL}, {POE_COL}" in result
+    assert not _secret_in(result, SECRET)
 
 
 @pytest.mark.parametrize(
@@ -1965,17 +2044,10 @@ def test_snmp_community_create_rejects_bad_view_args(
 @pytest.mark.parametrize(
     ("listing", "message"),
     [
-        (
-            VIEW_SHOW_RESTRICTED.replace(
-                "Subtree OID: 1.3.6.1.2.1.2.2.1.7.124", "Subtree OID: 1.3.6.1.2.1.2.2.1.7.24"
-            ),
-            "missing the ifAdminStatus exclusion(s) 1.3.6.1.2.1.2.2.1.7.124",
-        ),
-        (
-            VIEW_SHOW_RESTRICTED + "------------------------------\n"
-            + _view_block("ifmib_w", "1.3.6.1.2.1.105", "included"),
-            "POWER-ETHERNET-MIB",
-        ),
+        (_views(VIEW_SHOW_RESTRICTED, _view_block("ifmib_w", "1.3.6.1.2.1.105", "included")),
+         "POWER-ETHERNET-MIB"),
+        (_views(VIEW_SHOW_RESTRICTED, _view_block("ifmib_w", ALIAS_COL, "included", "ff:00")),
+         "unrecognised mask"),
         (VIEW_SHOW_RESTRICTED.replace("ifmib_w", "zzz"), "was not found"),
     ],
 )
@@ -2002,9 +2074,7 @@ def test_snmp_community_create_rw_access_mismatch_is_verification_failed(
 
     listing = _rw_listing(VIEW_SHOW_RESTRICTED)
     # The device bound the community with write none instead of ifmib_w.
-    listing[READBACK_SNMP_ACCESS] = ACCESS_SHOW_RW.replace(
-        "Write View: ifmib_w", "Write View: none"
-    )
+    listing[READBACK_SNMP_ACCESS] = UNBOUND_ACCESS
     sent: list[list[str]] = []
     with patch(
         "netmiko_mcp_linksys.server.run_in_session",
@@ -2017,22 +2087,6 @@ def test_snmp_community_create_rw_access_mismatch_is_verification_failed(
     assert SECRET not in result
 
 
-def test_snmp_community_remove_refuses_rw_without_ifindexes(
-    community_env: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from netmiko_mcp_linksys.server import snmp_community_remove
-
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
-    sent: list[list[str]] = []
-    session = _fake_snmp_session(_rw_listing(VIEW_SHOW_RESTRICTED), sent)
-    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
-        result = snmp_community_remove("public")
-    assert sent == []
-    assert result.startswith("Rejected:")
-    assert "SWITCH_SNMP_PROTECTED_IFINDEXES" in result
-    assert SECRET not in result
-
-
 # ---------------------------------------------------------------------------
 # View names are compared exactly; case-only variants are refused
 # (Cody, PR #8 review of 063cfd7). It is not live-confirmed whether ISS
@@ -2040,11 +2094,9 @@ def test_snmp_community_remove_refuses_rw_without_ifindexes(
 # ---------------------------------------------------------------------------
 
 CASE_SPLIT_VIEWS = _views(
-    # "wv" is a read view without exclusions; "WV" is a complete write view.
+    # "wv" is a read view; "WV" is a write view.
     _view_block("wv", "1.3.6.1.2.1.2", "included"),
-    _view_block("WV", EXCLUDED_OIDS[0], "excluded"),
-    _view_block("WV", EXCLUDED_OIDS[1], "excluded"),
-    _view_block("WV", "1.3.6.1.2.1.2.2.1.7", "included"),
+    _view_block("WV", ADMIN_COL, "included"),
 )
 
 
@@ -2058,89 +2110,19 @@ def test_case_variant_view_names() -> None:
 
 @pytest.mark.parametrize("name", ["wv", "WV"])
 def test_view_is_write_safe_refuses_case_merge(name: str) -> None:
-    ok, note = view_is_write_safe(parse_snmp_viewtree(CASE_SPLIT_VIEWS), name, EXCLUDED_OIDS)
+    ok, note = view_is_write_safe(parse_snmp_viewtree(CASE_SPLIT_VIEWS), name)
     assert not ok
     assert "differs only in letter case" in note
 
 
 def test_view_checks_are_case_sensitive() -> None:
     views = parse_snmp_viewtree(WRITE_VIEW_OK)
-    ok, note = view_is_write_safe(views, "IFMIB_W", EXCLUDED_OIDS)
+    ok, note = view_is_write_safe(views, "IFMIB_W")
     assert not ok
     assert "differs only in letter case" in note
     ok, note = view_is_restricted(parse_snmp_viewtree(VIEW_SHOW_RESTRICTED), "IFMIB")
     assert not ok
     assert "differs only in letter case" in note
-
-
-def test_cody_probe_r5(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Port of Cody's probe /tmp/cody/r5.py (write view hardening)."""
-    from netmiko_mcp_linksys.snmp_cli import required_write_exclusions
-
-    monkeypatch.setenv("SWITCH_PROTECTED_PORTS", "0/10,0/24")
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", "0/10=10,0/24=24")
-    ex = required_write_exclusions()
-    assert ex == ["1.3.6.1.2.1.2.2.1.7.10", "1.3.6.1.2.1.2.2.1.7.24"]
-    assert build_write_view_commands("wv", "1.3.6.1.2.1.2.2.1.7", ex) == [
-        "snmp view wv 1.3.6.1.2.1.2.2.1.7.10 excluded",
-        "snmp view wv 1.3.6.1.2.1.2.2.1.7.24 excluded",
-        "snmp view wv 1.3.6.1.2.1.2.2.1.7 included",
-    ]
-    for subtree in ("power-ethernet", "1.3.6.1.2.1.105", "1.3.6.1.2.1.2", "1.3.6.1"):
-        with pytest.raises(ValidationError):
-            normalize_write_subtree(subtree)
-
-    def blk(name: str, oid: str, typ: str, mask: str = "") -> str:
-        return f"View Name: {name}\nSubtree OID: {oid}\nSubtree Mask: {mask}\nView Type: {typ}\n"
-
-    def tree(*blocks: str) -> list[Any]:
-        return parse_snmp_viewtree("\n------------------------------\n".join(blocks))
-
-    good = [
-        blk("wv", "1.3.6.1.2.1.2.2.1.7.10", "excluded"),
-        blk("wv", "1.3.6.1.2.1.2.2.1.7.24", "excluded"),
-        blk("wv", "1.3.6.1.2.1.2.2.1.7", "included"),
-    ]
-    assert view_is_write_safe(tree(*good), "wv", ex)[0]
-    ok, note = view_is_write_safe(tree(*good, blk("wv", "1.3.6.1.2.1.105", "included")), "wv", ex)
-    assert not ok
-    assert "POWER-ETHERNET-MIB" in note
-    # Case merge: "wv" lacks the exclusions, "WV" has them.
-    case_merge = tree(
-        blk("wv", "1.3.6.1.2.1.2.2.1.7", "included"),
-        blk("WV", "1.3.6.1.2.1.2.2.1.7.10", "excluded"),
-        blk("WV", "1.3.6.1.2.1.2.2.1.7.24", "excluded"),
-        blk("WV", "1.3.6.1.2.1.2.2.1.7", "included"),
-    )
-    ok, note = view_is_write_safe(case_merge, "wv", ex)
-    assert not ok
-    assert "differs only in letter case" in note
-    leading_dot = tree(
-        blk("wv", ".1.3.6.1.2.1.2.2.1.7.10", "excluded"),
-        blk("wv", ".1.3.6.1.2.1.2.2.1.7.24", "excluded"),
-        blk("wv", "1.3.6.1.2.1.2.2.1.7", "included"),
-    )
-    # One leading dot is the same OID (central normalization, review of bc96149).
-    assert view_is_write_safe(leading_dot, "wv", ex)[0]
-    wildcard = tree(*good[:2], blk("wv", "1.3.6.1.2.1.2.2.1.7", "included", "ff:7f"))
-    assert not view_is_write_safe(wildcard, "wv", ex)[0]
-    for ports, idx in [
-        (None, "0/10=10"),
-        ("", "0/10=10"),
-        ("0/10,0/24", None),
-        ("0/10,0/24", "0/10=10"),
-        ("0/10", "0/10=10,0/24=24"),
-        ("0/10", "0/10=010"),
-        ("0/10", "0/10=0"),
-        ("0/10,0/24", "0/10=5,0/24=5"),
-    ]:
-        for key, value in (("SWITCH_PROTECTED_PORTS", ports), ("SWITCH_SNMP_PROTECTED_IFINDEXES", idx)):
-            if value is None:
-                monkeypatch.delenv(key, raising=False)
-            else:
-                monkeypatch.setenv(key, value)
-        with pytest.raises(ValidationError):
-            parse_protected_ifindexes()
 
 
 def test_attack_path_write_view_case_variant_refused_before_send() -> None:
@@ -2160,7 +2142,7 @@ def test_attack_path_write_view_case_variant_refused_before_send() -> None:
 
 
 def test_attack_path_community_rw_case_variant_refused(community_env: str) -> None:
-    """A community with write view "wv" must not pass via the "WV" exclusions."""
+    """A community with write view "wv" must not pass via the "WV" write view."""
     from netmiko_mcp_linksys.server import snmp_community_create
 
     listing = _rw_listing(_views(VIEW_SHOW_RESTRICTED, CASE_SPLIT_VIEWS))
@@ -2177,21 +2159,16 @@ def test_attack_path_community_rw_case_variant_refused(community_env: str) -> No
 
 
 @pytest.mark.parametrize(
-    ("view", "subtree", "access"),
-    [
-        ("WV", "interfaces", ACCESS_SHOW_RW),
-        ("IFMIB", "interfaces", ACCESS_SHOW_RW),
-        # Read view case variant of an existing view: PoE path.
-        ("IFMIB", "power-ethernet", ACCESS_SHOW_RW),
-    ],
+    ("view", "subtree"),
+    [("WV", "interfaces"), ("IFMIB", "interfaces"), ("IFMIB", "power-ethernet")],
 )
-def test_snmp_view_create_refuses_case_variant(view: str, subtree: str, access: str) -> None:
+def test_snmp_view_create_refuses_case_variant(view: str, subtree: str) -> None:
     from netmiko_mcp_linksys.server import snmp_view_create
 
     views = _views(VIEW_SHOW_RESTRICTED, _view_block("wv", "1.3.6.1.2.1.2", "included"))
     sent: list[list[str]] = []
     session = _fake_snmp_session(
-        {READBACK_SNMP_VIEW: views, READBACK_SNMP_ACCESS: access}, sent
+        {READBACK_SNMP_VIEW: views, READBACK_SNMP_ACCESS: ACCESS_SHOW_RW}, sent
     )
     with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
         result = snmp_view_create(view, subtree)
@@ -2216,430 +2193,10 @@ def test_snmp_view_create_refuses_unparseable_viewtree() -> None:
 
 
 # ---------------------------------------------------------------------------
-# PoE switching via SNMP (Vikunja task 48, Redy's plan approved by Roland):
-# the write view may include pethPsePortAdminEnable, with hard exclusions
-# for the protected ports from SWITCH_SNMP_PROTECTED_POE_INDEXES (fail-closed).
-# 0/15 is documentation-only and must not be locked technically.
+# Stateful switch stand-in: apply with error_pattern, read-back verification
+# and rollback to the exact previous viewtree on any failure.
 # ---------------------------------------------------------------------------
 
-POE_COL = "1.3.6.1.2.1.105.1.1.1.3"
-ADMIN_COL = "1.3.6.1.2.1.2.2.1.7"
-ALIAS_COL = "1.3.6.1.2.1.31.1.1.1.18"
-# Dummy indexes; deliberately not equal to the port numbers or ifIndexes.
-LIVE_PORTS_IFINDEX_ENV = "0/10=110,0/24=124"
-LIVE_PORTS_POE_ENV = "0/10=1.10,0/24=1.24"
-LIVE_ADMIN_EXCL = [f"{ADMIN_COL}.110", f"{ADMIN_COL}.124"]
-LIVE_POE_EXCL = [f"{POE_COL}.1.10", f"{POE_COL}.1.24"]
-
-
-@pytest.fixture
-def poe_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Production-like protected ports 0/24,0/10 with both index mappings."""
-    monkeypatch.setenv("SWITCH_PROTECTED_PORTS", "0/24,0/10")
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", LIVE_PORTS_IFINDEX_ENV)
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_POE_INDEXES", LIVE_PORTS_POE_ENV)
-
-
-def _poe_write_view(name: str = "ifmib_w", *, drop: str | None = None) -> str:
-    blocks = [
-        _view_block(name, oid, "excluded")
-        for oid in LIVE_ADMIN_EXCL + LIVE_POE_EXCL
-        if oid != drop
-    ]
-    blocks += [
-        _view_block(name, ADMIN_COL, "included"),
-        _view_block(name, POE_COL, "included"),
-    ]
-    return _views(*blocks)
-
-
-def _read_view_ifmib() -> str:
-    return _views(
-        _view_block("ifmib", "1.3.6.1.2.1.2", "included"),
-        _view_block("ifmib", "1.3.6.1.2.1.31", "included"),
-        _view_block("ifmib", "1.3.6.1.2.1.105", "included"),
-    )
-
-
-def _admin_only_write_view(name: str = "ifmib_w") -> str:
-    return _views(
-        _view_block(name, LIVE_ADMIN_EXCL[0], "excluded"),
-        _view_block(name, LIVE_ADMIN_EXCL[1], "excluded"),
-        _view_block(name, ADMIN_COL, "included"),
-    )
-
-
-def test_poe_index_env_valid_mapping(poe_env: None) -> None:
-    from netmiko_mcp_linksys.validation import parse_protected_poe_indexes
-
-    assert parse_protected_poe_indexes() == {"0/10": "1.10", "0/24": "1.24"}
-    assert parse_protected_poe_indexes(" 0/24 = 2.24 , 0/10=1.3 ") == {
-        "0/24": "2.24",
-        "0/10": "1.3",
-    }
-    assert parse_protected_poe_indexes("0/10=2147483647.1,0/24=1.2147483647")
-
-
-def test_poe_index_env_covers_only_poe_ports_of_protected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """conftest protects 0/24,0/25; 0/25 is an SFP port without a PoE row."""
-    from netmiko_mcp_linksys.validation import parse_protected_poe_indexes
-
-    monkeypatch.setenv("SWITCH_PROTECTED_PORTS", "0/24,0/25")
-    assert parse_protected_poe_indexes("0/24=1.24") == {"0/24": "1.24"}
-    with pytest.raises(ValidationError, match="invalid entry '0/25=1.25'"):
-        parse_protected_poe_indexes("0/24=1.24,0/25=1.25")
-
-
-@pytest.mark.parametrize(
-    ("raw", "message"),
-    [
-        ("", "is empty"),
-        (" , ", "is empty"),
-        ("0/10,0/24=1.24", "invalid entry"),
-        ("0/10=10,0/24=1.24", "invalid entry"),  # needs <group>.<port>
-        ("0/10=1.2.3,0/24=1.24", "invalid entry"),
-        ("0/10=0.10,0/24=1.24", "invalid entry"),
-        ("0/10=1.0,0/24=1.24", "invalid entry"),
-        ("0/10=01.10,0/24=1.24", "invalid entry"),
-        ("0/10=1.010,0/24=1.24", "invalid entry"),
-        ("0/10=-1.10,0/24=1.24", "invalid entry"),
-        ("0/10=1.-10,0/24=1.24", "invalid entry"),
-        ("0/10=+1.10,0/24=1.24", "invalid entry"),
-        ("0/10=a.b,0/24=1.24", "invalid entry"),
-        ("0/10=1.,0/24=1.24", "invalid entry"),
-        ("0/10=.10,0/24=1.24", "invalid entry"),
-        ("0/10=1 .10,0/24=1.24", "invalid entry"),
-        ("0/10=2147483648.10,0/24=1.24", "invalid entry"),
-        ("0/10=1.2147483648,0/24=1.24", "invalid entry"),
-        ("0/010=1.10,0/24=1.24", "invalid entry"),
-        ("0/99=1.10,0/24=1.24", "invalid entry"),
-        ("0/10=1.10,0/24=1.24,0/10=1.11", "more than once"),
-        ("0/10=1.24,0/24=1.24", "same PoE index"),
-        ("0/24=1.24", "missing protected port(s) 0/10"),
-        (
-            "0/10=1.10,0/24=1.24,0/15=1.15",
-            "not in the PoE ports of SWITCH_PROTECTED_PORTS 0/15",
-        ),
-    ],
-)
-def test_poe_index_env_rejects_bad_values(poe_env: None, raw: str, message: str) -> None:
-    import re as _re
-
-    from netmiko_mcp_linksys.validation import parse_protected_poe_indexes
-
-    with pytest.raises(ValidationError, match=_re.escape(message)):
-        parse_protected_poe_indexes(raw)
-
-
-def test_poe_index_env_unset_or_protected_ports_unset(
-    poe_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from netmiko_mcp_linksys.validation import parse_protected_poe_indexes
-
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_POE_INDEXES")
-    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_POE_INDEXES is not set"):
-        parse_protected_poe_indexes()
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_POE_INDEXES", LIVE_PORTS_POE_ENV)
-    monkeypatch.delenv("SWITCH_PROTECTED_PORTS")
-    with pytest.raises(ValidationError, match="SWITCH_PROTECTED_PORTS is not set"):
-        parse_protected_poe_indexes()
-
-
-def test_poe_exclusion_oid_format_and_numeric_sort() -> None:
-    from netmiko_mcp_linksys.snmp_cli import protected_poe_admin_oids
-
-    assert protected_poe_admin_oids({"0/24": "1.24", "0/10": "1.10", "0/9": "1.9"}) == [
-        f"{POE_COL}.1.9",
-        f"{POE_COL}.1.10",
-        f"{POE_COL}.1.24",
-    ]
-    assert protected_poe_admin_oids({"0/10": "2.1", "0/24": "1.30"}) == [
-        f"{POE_COL}.1.30",
-        f"{POE_COL}.2.1",
-    ]
-
-
-def test_poe_write_view_commands_send_all_exclusions_before_include(poe_env: None) -> None:
-    from netmiko_mcp_linksys.snmp_cli import write_view_exclusions
-
-    exclusions = write_view_exclusions([], "ifmib_w", adding=POE_COL)
-    assert exclusions == LIVE_ADMIN_EXCL + LIVE_POE_EXCL
-    cmds = build_write_view_commands("ifmib_w", POE_COL, exclusions)
-    assert cmds == [
-        f"snmp view ifmib_w {ADMIN_COL}.110 excluded",
-        f"snmp view ifmib_w {ADMIN_COL}.124 excluded",
-        f"snmp view ifmib_w {POE_COL}.1.10 excluded",
-        f"snmp view ifmib_w {POE_COL}.1.24 excluded",
-        f"snmp view ifmib_w {POE_COL} included",
-    ]
-    # Every excluded line comes before the only included line.
-    assert all(line.endswith(" excluded") for line in cmds[:-1])
-    assert cmds[-1].endswith(" included")
-    with pytest.raises(ValidationError, match="No pethPsePortAdminEnable exclusions"):
-        build_write_view_commands("ifmib_w", POE_COL, LIVE_ADMIN_EXCL)
-
-
-def test_write_view_exclusions_need_poe_env_only_with_poe(
-    poe_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from netmiko_mcp_linksys.snmp_cli import write_view_exclusions
-
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_POE_INDEXES")
-    admin_only = parse_snmp_viewtree(_admin_only_write_view())
-    assert write_view_exclusions(admin_only, "ifmib_w") == LIVE_ADMIN_EXCL
-    assert write_view_exclusions(admin_only, "ifmib_w", adding=ALIAS_COL) == LIVE_ADMIN_EXCL
-    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_POE_INDEXES is not set"):
-        write_view_exclusions(admin_only, "ifmib_w", adding=POE_COL)
-    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_POE_INDEXES is not set"):
-        write_view_exclusions(parse_snmp_viewtree(_poe_write_view()), "ifmib_w")
-
-
-def test_view_is_write_safe_with_poe(poe_env: None) -> None:
-    ok, note = view_is_write_safe(
-        parse_snmp_viewtree(_poe_write_view()),
-        "ifmib_w",
-        LIVE_ADMIN_EXCL + LIVE_POE_EXCL,
-    )
-    assert ok, note
-    assert f"includes only {ADMIN_COL}, {POE_COL}" in note
-    assert f"{POE_COL}.1.10" in note and f"{POE_COL}.1.24" in note
-
-
-@pytest.mark.parametrize(
-    ("listing", "exclusions", "message"),
-    [
-        (
-            _poe_write_view(drop=f"{POE_COL}.1.10"),
-            LIVE_ADMIN_EXCL + LIVE_POE_EXCL,
-            f"missing the pethPsePortAdminEnable exclusion(s) {POE_COL}.1.10",
-        ),
-        (
-            _poe_write_view(drop=f"{ADMIN_COL}.124"),
-            LIVE_ADMIN_EXCL + LIVE_POE_EXCL,
-            f"missing the ifAdminStatus exclusion(s) {ADMIN_COL}.124",
-        ),
-        (
-            # A caller that forgot the PoE exclusions must not pass.
-            _poe_write_view(),
-            LIVE_ADMIN_EXCL,
-            "no PoE exclusions are configured",
-        ),
-        (
-            _views(_poe_write_view(), _view_block("ifmib_w", "1.3.6.1.2.1.105", "included")),
-            LIVE_ADMIN_EXCL + LIVE_POE_EXCL,
-            "whole POWER-ETHERNET-MIB",
-        ),
-        (
-            _views(_poe_write_view(), _view_block("ifmib_w", "1.3.6.1.2.1.2", "included")),
-            LIVE_ADMIN_EXCL + LIVE_POE_EXCL,
-            "includes subtree 1.3.6.1.2.1.2, which is not allowed",
-        ),
-        (
-            # A PoE exclusion written as "included" widens instead of narrowing.
-            _views(_poe_write_view(), _view_block("ifmib_w", f"{POE_COL}.1.10", "included")),
-            LIVE_ADMIN_EXCL + LIVE_POE_EXCL,
-            "not allowed in a write view",
-        ),
-    ],
-)
-def test_view_is_write_safe_rejects_poe_gaps(
-    poe_env: None, listing: str, exclusions: list[str], message: str
-) -> None:
-    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "ifmib_w", exclusions)
-    assert not ok
-    assert message in note
-
-
-def test_port_0_15_is_not_locked(monkeypatch: pytest.MonkeyPatch) -> None:
-    """0/15 (EoC converter with Zigbee router) is a README note, not a lock."""
-    from netmiko_mcp_linksys.snmp_cli import write_view_exclusions
-    from netmiko_mcp_linksys.validation import parse_protected_poe_indexes
-
-    monkeypatch.setenv("SWITCH_PROTECTED_PORTS", "0/24,0/10")
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", "0/10=110,0/24=124")
-    # Port-number-like indexes make a hidden 0/15 entry easy to spot.
-    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_POE_INDEXES", "0/10=1.10,0/24=1.24")
-    exclusions = write_view_exclusions([], "wv", adding=POE_COL)
-    assert exclusions == LIVE_ADMIN_EXCL + LIVE_POE_EXCL
-    assert not any(oid.endswith(".15") or ".15." in oid for oid in exclusions)
-    cmds = build_write_view_commands("wv", POE_COL, exclusions)
-    assert not any("0/15" in line or line.split()[3].endswith(".15") for line in cmds)
-    # Listing 0/15 in the env is refused instead of silently adding a lock.
-    with pytest.raises(ValidationError, match="not in the PoE ports of SWITCH_PROTECTED_PORTS 0/15"):
-        parse_protected_poe_indexes("0/10=1.10,0/24=1.24,0/15=1.15")
-
-
-@pytest.mark.parametrize(
-    ("poe_value", "message"),
-    [
-        (None, "SWITCH_SNMP_PROTECTED_POE_INDEXES is not set"),
-        ("", "SWITCH_SNMP_PROTECTED_POE_INDEXES is empty"),
-        ("0/10=1.10", "missing protected port(s) 0/24"),
-        ("0/10=1.10,0/24=1.10", "same PoE index"),
-        ("0/10=1.10,0/24=24", "invalid entry"),
-    ],
-)
-def test_snmp_write_view_create_poe_fail_closed(
-    poe_env: None, monkeypatch: pytest.MonkeyPatch, poe_value: str | None, message: str
-) -> None:
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    if poe_value is None:
-        monkeypatch.delenv("SWITCH_SNMP_PROTECTED_POE_INDEXES")
-    else:
-        monkeypatch.setenv("SWITCH_SNMP_PROTECTED_POE_INDEXES", poe_value)
-    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
-        result = snmp_write_view_create("ifmib_w", POE_COL)
-    run.assert_not_called()
-    assert result.startswith("Rejected:")
-    assert message in result
-
-
-def test_snmp_write_view_create_column_on_poe_view_needs_poe_env(
-    poe_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_POE_INDEXES")
-    sent: list[list[str]] = []
-    session = _fake_snmp_session({READBACK_SNMP_VIEW: _poe_write_view()}, sent)
-    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
-        result = snmp_write_view_create("ifmib_w", "ifAlias")
-    assert sent == []
-    assert result.startswith("Rejected:")
-    assert "SWITCH_SNMP_PROTECTED_POE_INDEXES is not set" in result
-
-
-def test_snmp_write_view_create_poe_requires_write_flag(
-    poe_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from netmiko_mcp_linksys.server import snmp_write_view_create
-
-    monkeypatch.delenv("SWITCH_SNMP_WRITE_ENABLED")
-    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
-        result = snmp_write_view_create("ifmib_w", "pethPsePortAdminEnable")
-    run.assert_not_called()
-    assert result.startswith("Rejected:")
-    assert "SWITCH_SNMP_WRITE_ENABLED" in result
-
-
-def _poe_rw_listing() -> dict[str, str]:
-    return _rw_listing(_views(_read_view_ifmib(), _poe_write_view()))
-
-
-def test_snmp_community_create_rw_with_poe_write_view(poe_env: None, community_env: str) -> None:
-    from netmiko_mcp_linksys.server import snmp_community_create
-
-    sent: list[list[str]] = []
-    with patch(
-        "netmiko_mcp_linksys.server.run_in_session",
-        side_effect=_fake_snmp_session(_poe_rw_listing(), sent),
-    ):
-        result = snmp_community_create("ifmib", "rw", "ifmib_w")
-    assert len(sent) == 1
-    assert "Read-back check:" in result
-    assert f"{POE_COL}.1.10" in result
-    assert not _secret_in(result, SECRET)
-
-
-def test_snmp_community_create_rw_poe_view_refused_without_poe_env(
-    poe_env: None, community_env: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from netmiko_mcp_linksys.server import snmp_community_create
-
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_POE_INDEXES")
-    sent: list[list[str]] = []
-    with patch(
-        "netmiko_mcp_linksys.server.run_in_session",
-        side_effect=_fake_snmp_session(_poe_rw_listing(), sent),
-    ):
-        result = snmp_community_create("ifmib", "rw", "ifmib_w")
-    assert sent == []
-    assert result.startswith("Rejected:")
-    assert "SWITCH_SNMP_PROTECTED_POE_INDEXES is not set" in result
-    assert SECRET not in result
-
-
-def test_snmp_community_create_rw_poe_view_missing_poe_exclusion(
-    poe_env: None, community_env: str
-) -> None:
-    from netmiko_mcp_linksys.server import snmp_community_create
-
-    listing = _rw_listing(
-        _views(_read_view_ifmib(), _poe_write_view(drop=f"{POE_COL}.1.24"))
-    )
-    sent: list[list[str]] = []
-    with patch(
-        "netmiko_mcp_linksys.server.run_in_session",
-        side_effect=_fake_snmp_session(listing, sent),
-    ):
-        result = snmp_community_create("ifmib", "rw", "ifmib_w")
-    assert sent == []
-    assert result.startswith("Rejected:")
-    assert f"pethPsePortAdminEnable exclusion(s) {POE_COL}.1.24" in result
-
-
-def test_ready_with_poe_write_view_needs_poe_env(
-    poe_env: None, community_env: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    views = _views(_read_view_ifmib(), _poe_write_view())
-    status = _ready(ACCESS_SHOW_RW, views)
-    assert f"excludes {', '.join(LIVE_ADMIN_EXCL + LIVE_POE_EXCL)}" in status
-    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_POE_INDEXES")
-    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_POE_INDEXES is not set"):
-        _ready(ACCESS_SHOW_RW, views)
-
-
-@pytest.mark.parametrize("subtree", ["interfaces", "ifmib", "power-ethernet"])
-def test_snmp_view_create_refuses_whole_subtree_in_poe_write_view(
-    poe_env: None, subtree: str
-) -> None:
-    """A whole MIB added to a write view would bypass the column narrowing."""
-    from netmiko_mcp_linksys.server import snmp_view_create
-
-    unbound = ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: none")
-    for access, message in (
-        (ACCESS_SHOW_RW, "is used as a write view"),
-        (unbound, "has protected-port exclusions"),
-    ):
-        sent: list[list[str]] = []
-        session = _fake_snmp_session(
-            {READBACK_SNMP_ACCESS: access, READBACK_SNMP_VIEW: _poe_write_view()}, sent
-        )
-        with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
-            result = snmp_view_create("ifmib_w", subtree)
-        assert sent == []
-        assert result.startswith("Rejected:")
-        assert message in result
-
-
-def test_snmp_view_create_refuses_view_with_only_poe_exclusions(poe_env: None) -> None:
-    from netmiko_mcp_linksys.server import snmp_view_create
-
-    only_poe = _views(
-        _view_block("pw", LIVE_POE_EXCL[0], "excluded"),
-        _view_block("pw", POE_COL, "included"),
-    )
-    unbound = ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: none")
-    sent: list[list[str]] = []
-    session = _fake_snmp_session(
-        {READBACK_SNMP_ACCESS: unbound, READBACK_SNMP_VIEW: only_poe}, sent
-    )
-    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
-        result = snmp_view_create("pw", "power-ethernet")
-    assert sent == []
-    assert "has protected-port exclusions" in result
-
-
-# ---------------------------------------------------------------------------
-# Cody's review of bc96149 (r7.py / r7b.py) and Redy's additions:
-# write views change all-or-nothing (exclusions first, verified, include
-# only then, rollback to the exact previous viewtree on any failure), and
-# one central OID normalization with whole-arc prefix comparison; partial
-# masks are never treated as safe.
-# ---------------------------------------------------------------------------
 
 class FakeSwitch:
     """Stateful viewtree stand-in for the netmiko connection.
@@ -2647,6 +2204,7 @@ class FakeSwitch:
     Behaves like ISS + netmiko: each config line gets an output line, a
     refused line prints "% Invalid input", and with ``error_pattern``
     netmiko raises at the first matching line and sends nothing after it.
+    ``redy_format`` renders the viewtree like Redy's read check.
     """
 
     def __init__(
@@ -2656,12 +2214,16 @@ class FakeSwitch:
         refuse: Any = None,
         silent_drop: Any = None,
         access: str | None = None,
+        redy_format: bool = False,
+        mask: str = "",
     ) -> None:
+        self.mask = mask
         self.views: list[tuple[str, str, str, str]] = [
-            (name, oid, typ, "") for name, oid, typ in (views or [("iso", "1", "included")])
+            (name, oid, typ, mask) for name, oid, typ in (views or [("iso", "1", "included")])
         ]
         self.refuse = refuse or (lambda cmd: False)
         self.silent_drop = silent_drop or (lambda cmd: False)
+        self.redy_format = redy_format
         self.access = access or (
             "Group Name: iso\nSecurity Model: v1\nRead View: iso\n"
             "Write View: iso\nNotify View: iso\n"
@@ -2670,6 +2232,11 @@ class FakeSwitch:
         self.kwargs: list[dict[str, Any]] = []
 
     def tree(self) -> str:
+        if self.redy_format:
+            return "------------------------------\n".join(
+                _redy_block(name, oid, typ.capitalize(), mask)
+                for name, oid, typ, mask in self.views
+            )
         return "------------------------------\n".join(
             _view_block(name, oid, typ, mask) for name, oid, typ, mask in self.views
         )
@@ -2686,7 +2253,7 @@ class FakeSwitch:
             if len(self.views) == before:
                 raise KeyError(cmd)
         elif parts[:2] == ["snmp", "view"]:
-            self.views.append((parts[2], parts[3], parts[4], ""))
+            self.views.append((parts[2], parts[3], parts[4], self.mask))
 
     def send_config_set(self, commands: list[str], **kwargs: Any) -> str:
         self.kwargs.append(kwargs)
@@ -2731,201 +2298,201 @@ def _run_on(switch: FakeSwitch, tool: str, *args: str) -> str:
         return getattr(server, tool)(*args)
 
 
-_ADMIN_WV = [
-    ("wv", f"{ADMIN_COL}.110", "excluded"),
-    ("wv", f"{ADMIN_COL}.124", "excluded"),
-    ("wv", ADMIN_COL, "included"),
-]
-
-
 def _wv_entries(switch: FakeSwitch) -> list[tuple[str, str, str, str]]:
     return [v for v in switch.views if v[0] == "wv"]
 
 
-# --- two-stage apply: happy paths -----------------------------------------
+# --- apply: happy paths ------------------------------------------------------
 
 
-def test_write_view_two_stage_happy_path_poe(poe_env: None, audit_log) -> None:
+@pytest.mark.parametrize(
+    ("subtree", "column"),
+    [("ifAdminStatus", ADMIN_COL), ("ifAlias", ALIAS_COL), ("pethPsePortAdminEnable", POE_COL)],
+)
+def test_write_view_happy_path(subtree: str, column: str, audit_log) -> None:
     switch = FakeSwitch()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert switch.batches == [
-        [
-            f"snmp view wv {ADMIN_COL}.110 excluded",
-            f"snmp view wv {ADMIN_COL}.124 excluded",
-            f"snmp view wv {POE_COL}.1.10 excluded",
-            f"snmp view wv {POE_COL}.1.24 excluded",
-        ],
-        [f"snmp view wv {POE_COL} included"],
-    ]
-    # Both stages run with error_pattern so netmiko stops at a "%" line.
-    assert [kw.get("error_pattern") for kw in switch.kwargs] == ["%", "%"]
+    result = _run_on(switch, "snmp_write_view_create", "wv", subtree)
+    assert switch.batches == [[f"snmp view wv {column} included"]]
+    # Sent with error_pattern so netmiko stops at a "%" line.
+    assert [kw.get("error_pattern") for kw in switch.kwargs] == ["%"]
+    assert not any(" excluded" in cmd for cmd in switch.sent)
     assert result.startswith("Configuration sent:")
-    assert f"Read-back check: write view wv includes only {POE_COL} and excludes" in result
+    assert f"Read-back check: write view wv includes only {column}." in result
 
 
-def test_write_view_two_stage_happy_path_admin(audit_log) -> None:
-    switch = FakeSwitch()
-    result = _run_on(switch, "snmp_write_view_create", "ifmib_w", "ifAdminStatus")
-    assert switch.batches == [
-        [
-            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.124 excluded",
-            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.125 excluded",
-        ],
-        ["snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7 included"],
-    ]
-    assert (
-        "Read-back check: write view ifmib_w includes only 1.3.6.1.2.1.2.2.1.7 "
-        "and excludes" in result
+def test_write_view_happy_path_redy_format() -> None:
+    """End to end against Redy's viewtree format with "Subtree Mask : 1"."""
+    switch = FakeSwitch(
+        views=[("iso", "1", "included"), ("restricted", "1", "included")],
+        redy_format=True,
+        mask="1",
     )
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert switch.batches == [[f"snmp view wv {POE_COL} included"]]
+    assert f"Read-back check: write view wv includes only {POE_COL}." in result
 
 
-def test_write_view_adds_column_without_resending_present_exclusions(poe_env: None) -> None:
-    switch = FakeSwitch(views=[("iso", "1", "included"), *_ADMIN_WV])
-    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAlias")
-    assert switch.batches == [[f"snmp view wv {ALIAS_COL} included"]]
-    assert result.startswith("Configuration sent:")
+def test_write_view_adds_second_column() -> None:
+    switch = FakeSwitch(views=[("iso", "1", "included"), ("wv", ADMIN_COL, "included")])
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert switch.batches == [[f"snmp view wv {POE_COL} included"]]
+    assert f"includes only {ADMIN_COL}, {POE_COL}" in result
 
 
-def test_write_view_adding_poe_to_bound_view_sends_only_poe_exclusions(poe_env: None) -> None:
-    switch = FakeSwitch(views=[("iso", "1", "included"), *_ADMIN_WV])
-    _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert switch.batches == [
-        [f"snmp view wv {POE_COL}.1.10 excluded", f"snmp view wv {POE_COL}.1.24 excluded"],
-        [f"snmp view wv {POE_COL} included"],
-    ]
-
-
-def test_write_view_column_on_poe_view_keeps_poe_exclusions(poe_env: None) -> None:
-    views = [
-        ("iso", "1", "included"),
-        *_ADMIN_WV,
-        ("wv", f"{POE_COL}.1.10", "excluded"),
-        ("wv", f"{POE_COL}.1.24", "excluded"),
-        ("wv", POE_COL, "included"),
-    ]
-    switch = FakeSwitch(views=views)
-    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAlias")
-    assert switch.batches == [[f"snmp view wv {ALIAS_COL} included"]]
-    assert f"{POE_COL}.1.24" in result
-
-
-def test_write_view_nothing_to_send_when_complete(poe_env: None) -> None:
-    switch = FakeSwitch(views=[("iso", "1", "included"), *_ADMIN_WV])
+def test_write_view_nothing_to_send_when_present_in_other_spelling() -> None:
+    switch = FakeSwitch(views=[("iso", "1", "included"), ("wv", f"iso.{ADMIN_COL[2:]}", "included")])
     result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
     assert switch.batches == []
     assert result.startswith("Nothing to send")
 
 
-# --- two-stage apply: abort before the include, rollback ------------------
+# --- apply: failures and rollback --------------------------------------------
 
 
-def test_r7_4b_refused_exclusions_abort_before_include(poe_env: None) -> None:
-    """r7.py 4b: every exclusion gets "% Invalid input"; the include must never go out."""
-    switch = FakeSwitch(refuse=lambda cmd: cmd.endswith(" excluded"))
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert not any(cmd.endswith(" included") for cmd in switch.sent)
-    assert result.startswith("Error: Exclusions were not applied")
-    assert f"the included column {POE_COL} was NOT sent" in result
-    assert "Rolled back" in result
-    assert switch.snapshot() == before
-
-
-def test_r7b_silent_exclusion_drop_aborts_before_include(poe_env: None) -> None:
-    """r7b.py: exclusions echo fine but are not installed (no "%" text)."""
-    switch = FakeSwitch(silent_drop=lambda cmd: cmd.endswith(" excluded"))
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert not any(cmd.endswith(" included") for cmd in switch.sent)
-    assert "exclusion(s) missing in show snmp viewtree" in result
-    assert "Rolled back" in result
-    assert switch.snapshot() == before
-    assert _wv_entries(switch) == []
-
-
-def test_r7b_already_bound_view_silent_drop_keeps_previous_state(poe_env: None) -> None:
-    """r7b.py second case: pre-existing exclusions must survive the rollback."""
-    switch = FakeSwitch(
-        views=[("iso", "1", "included"), *_ADMIN_WV],
-        silent_drop=lambda cmd: cmd.endswith(" excluded"),
-    )
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert result.startswith("Error: Exclusions were not applied")
-    assert not any(cmd.endswith(" included") for cmd in switch.sent)
-    # Only this call's PoE exclusions are rolled back, never the old ones.
-    assert not any(f"{ADMIN_COL}." in cmd and cmd.startswith("no ") for cmd in switch.sent)
-    assert switch.snapshot() == before
-
-
-def test_partial_exclusion_failure_rolls_back_the_ones_already_set(poe_env: None) -> None:
-    """Redy: the first exclusion lands, the second is refused -> undo the first."""
-    switch = FakeSwitch(refuse=lambda cmd: cmd == f"snmp view wv {ADMIN_COL}.124 excluded")
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    # netmiko stopped at the refused line: the PoE exclusions were never sent.
-    assert switch.batches[0] == [
-        f"snmp view wv {ADMIN_COL}.110 excluded",
-        f"snmp view wv {ADMIN_COL}.124 excluded",
-    ]
-    assert f"no snmp view wv {ADMIN_COL}.110" in switch.sent
-    assert not any(cmd.endswith(" included") for cmd in switch.sent)
-    assert "Rolled back" in result
-    assert switch.snapshot() == before
-
-
-def test_r7_4c_include_error_rolls_back_include_and_exclusions(poe_env: None) -> None:
-    """r7.py 4c: the include line is refused -> remove it and this call's exclusions."""
+def test_include_refused_is_rolled_back() -> None:
     switch = FakeSwitch(refuse=lambda cmd: cmd.endswith(" included"))
     before = switch.snapshot()
     result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
     assert result.startswith("Error: Configuration was sent, verification failed:")
-    # Include removal is its own stage, before any exclusion is touched.
-    assert switch.batches[-2] == [f"no snmp view wv {POE_COL}"]
-    assert set(switch.batches[-1]) == {
-        f"no snmp view wv {oid}" for oid in LIVE_ADMIN_EXCL + LIVE_POE_EXCL
-    }
-    assert "Rolled back" in result
+    assert switch.batches[-1] == [f"no snmp view wv {POE_COL}"]
+    assert "Rolled back" in result and "ROLLBACK NOT VERIFIED" not in result
     assert switch.snapshot() == before
 
 
-def test_include_silently_dropped_is_verification_failure_with_rollback(poe_env: None) -> None:
+def test_include_silently_dropped_is_verification_failure_with_rollback() -> None:
     switch = FakeSwitch(silent_drop=lambda cmd: cmd.endswith(" included"))
     before = switch.snapshot()
     result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
     assert result.startswith("Error: Configuration was sent, verification failed:")
+    assert "write view 'wv' was not found in the read-back" in result
     assert "Rolled back" in result
     assert switch.snapshot() == before
 
 
-def test_include_readback_with_lost_exclusion_rolls_back(poe_env: None) -> None:
-    """The include lands, but the device then shows one exclusion gone."""
-    switch = FakeSwitch()
+class _TimeoutAfterInclude(FakeSwitch):
+    def send_config_set(self, commands: list[str], **kwargs: Any) -> str:
+        if commands and commands[0].endswith(" included"):
+            self.kwargs.append(kwargs)
+            self.batches.append(list(commands))
+            self._apply(commands[0])
+            raise TimeoutError("timeout after include was applied")
+        return super().send_config_set(commands, **kwargs)
 
+
+def test_timeout_after_include_applied_is_rolled_back() -> None:
+    switch = _TimeoutAfterInclude()
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    assert "Configuration was sent, verification failed" in result
+    assert "timeout after include" in result
+    assert "Rolled back" in result
+    assert switch.batches[-1] == [f"no snmp view wv {POE_COL}"]
+    assert switch.snapshot() == before
+
+
+def test_readback_with_wildcard_mask_is_rolled_back() -> None:
+    """The include lands, but the device shows it with a partial mask."""
+    switch = FakeSwitch(mask="ff:7f")
+    switch.views = [("iso", "1", "included", "")]
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert result.startswith("Error: Configuration was sent, verification failed:")
+    assert "unrecognised mask" in result
+    assert "Rolled back" in result
+    assert switch.snapshot() == before
+
+
+def test_readback_exception_after_include_is_rolled_back() -> None:
+    from netmiko_mcp_linksys import server
+
+    switch = FakeSwitch()
+    real_read = server._read_views
+    calls = {"n": 0}
+
+    def flaky_read(conn: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:  # the verification read right after the include
+            raise TimeoutError("viewtree read-back timed out")
+        return real_read(conn)
+
+    with patch.object(server, "_read_views", side_effect=flaky_read):
+        result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert "verification failed: viewtree read-back timed out" in result
+    assert "Rolled back" in result
+    assert _wv_entries(switch) == []
+
+
+def test_rollback_refused_is_reported_not_verified() -> None:
+    switch = FakeSwitch(refuse=lambda cmd: cmd.startswith("no snmp view"))
     original = switch._apply
 
-    def apply_and_lose(cmd: str) -> None:
+    def apply_with_alias(cmd: str) -> None:
         original(cmd)
         if cmd.endswith(" included"):
-            switch.views = [v for v in switch.views if v[1] != f"{POE_COL}.1.10"]
+            # The device also shows an extra column, so verification fails.
+            switch.views.append(("wv", "1.3.6.1.2.1.2", "included", ""))
 
-    switch._apply = apply_and_lose  # type: ignore[method-assign]
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert result.startswith("Error: Configuration was sent, verification failed:")
-    assert f"pethPsePortAdminEnable exclusion(s) {POE_COL}.1.10" in result
-    # Rollback removed the include; the lost exclusion cannot be removed,
-    # so the end state equals the state before only for the other entries.
-    assert not any(v[2] == "included" and v[0] == "wv" for v in switch.views)
-
-
-def test_rollback_that_cannot_be_verified_is_reported(poe_env: None) -> None:
-    switch = FakeSwitch(
-        refuse=lambda cmd: cmd.endswith(" included") or cmd.startswith("no snmp view")
-    )
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
+    switch._apply = apply_with_alias  # type: ignore[method-assign]
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
     assert result.startswith("Error: Configuration was sent, verification failed:")
     assert "ROLLBACK NOT VERIFIED" in result
     assert "do not bind a community" in result
+    assert "The switch reported an error for the removal." in result
+
+
+class _RollbackBoom(FakeSwitch):
+    def send_config_set(self, commands: list[str], **kwargs: Any) -> str:
+        if commands and commands[0].startswith("no "):
+            self.kwargs.append(kwargs)
+            self.batches.append(list(commands))
+            raise TimeoutError("rollback send timeout")
+        return super().send_config_set(commands, **kwargs)
+
+
+def test_rollback_send_raises_is_reported() -> None:
+    switch = _RollbackBoom(silent_drop=lambda cmd: cmd.endswith(" included"))
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    # Nothing was installed, so the viewtree still matches the state before.
+    assert "Rolled back" in result
+    assert "The switch reported an error for the removal." in result
+    switch = _RollbackBoom(refuse=lambda cmd: False)
+    original = switch._apply
+
+    def apply_and_widen(cmd: str) -> None:
+        original(cmd)
+        switch.views.append(("wv", "1", "included", ""))
+
+    switch._apply = apply_and_widen  # type: ignore[method-assign]
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert "ROLLBACK NOT VERIFIED" in result
+
+
+def test_existing_column_failing_verification_is_not_removed() -> None:
+    """A column that was already there is never removed by this call."""
+    switch = FakeSwitch(
+        views=[
+            ("iso", "1", "included"),
+            ("wv", ADMIN_COL, "included"),
+            ("wv", "1.3.6.1.2.1.2", "included"),
+        ]
+    )
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert result.startswith("Rejected:")
+    assert "already includes 1.3.6.1.2.1.2" in result
+    assert switch.batches == []
+
+
+def test_present_column_in_unsafe_view_is_refused_without_send() -> None:
+    """Nothing to add, but the view fails the check: refuse, remove nothing."""
+    switch = FakeSwitch(
+        views=[("iso", "1", "included"), ("wv", ADMIN_COL, "included"), ("wv", ALIAS_COL, "")]
+    )
+    before = switch.snapshot()
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    assert result.startswith("Rejected: Nothing was sent:")
+    assert "included/excluded type" in result
+    assert switch.batches == []
+    assert switch.snapshot() == before
 
 
 def test_send_config_passes_error_pattern_to_netmiko() -> None:
@@ -2946,7 +2513,7 @@ def test_send_config_passes_error_pattern_to_netmiko() -> None:
     assert refused.sent == ["snmp view a 1.3.6.1.2.1.2 included"]
 
 
-# --- central OID normalization and masks ----------------------------------
+# --- central OID normalization -------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -2960,6 +2527,7 @@ def test_send_config_passes_error_pattern_to_netmiko() -> None:
         ("ISO.3.6.1", (1, 3, 6, 1)),
         (".iso.3.6.1.", (1, 3, 6, 1)),
         ("0.0", (0, 0)),
+        ("1", (1,)),
     ],
 )
 def test_oid_arcs_accepts_known_spellings(raw: str, arcs: tuple[int, ...]) -> None:
@@ -2980,7 +2548,7 @@ def test_oid_arcs_refuses_unknown_formats(raw: str) -> None:
 
 
 def test_oid_within_compares_whole_arcs() -> None:
-    assert oid_within("1.3.6.1.2.1.105.1.1.1.3.1.10", POE_COL)
+    assert oid_within(f"{POE_COL}.1.10", POE_COL)
     assert oid_within(".iso.3.6.1.2.1.105.1.1.1.3.1.10", POE_COL)
     assert oid_within(POE_COL, POE_COL)
     assert not oid_within("1.3.6.1.2.1.105", "1.3.6.1.2.1.10")
@@ -2988,34 +2556,14 @@ def test_oid_within_compares_whole_arcs() -> None:
     assert not oid_within("garbage", "1")
 
 
-@pytest.mark.parametrize(
-    "spelling",
-    [".{oid}", "iso.{rest}", ".iso.{rest}", " {oid}. "],
-)
-def test_r7_4d_precheck_sees_exclusions_in_any_spelling(spelling: str) -> None:
-    """r7.py 4d / r7b.py: hidden exclusions must not let a whole MIB into a write view."""
-
-    def spell(oid: str) -> str:
-        return spelling.format(oid=oid, rest=oid.split(".", 1)[1])
-
-    switch = FakeSwitch(
-        views=[
-            ("iso", "1", "included"),
-            ("wv", spell(f"{ADMIN_COL}.110"), "excluded"),
-            ("wv", spell(f"{ADMIN_COL}.124"), "excluded"),
-            ("wv", ADMIN_COL, "included"),
-        ]
-    )
+@pytest.mark.parametrize("spelling", [".{oid}", "iso.{rest}", ".iso.{rest}", " {oid}. "])
+def test_precheck_sees_writable_column_in_any_spelling(spelling: str) -> None:
+    """A whole MIB must not get into a write view through another OID spelling."""
+    column = spelling.format(oid=ADMIN_COL, rest=ADMIN_COL.split(".", 1)[1])
+    switch = FakeSwitch(views=[("iso", "1", "included"), ("wv", column, "included")])
     result = _run_on(switch, "snmp_view_create", "wv", "power-ethernet")
     assert result.startswith("Rejected:")
     assert "so it is a write view" in result
-    assert switch.batches == []
-
-
-def test_precheck_sees_writable_column_without_exclusions() -> None:
-    switch = FakeSwitch(views=[("iso", "1", "included"), ("wv", f"iso.{POE_COL[2:]}", "included")])
-    result = _run_on(switch, "snmp_view_create", "wv", "interfaces")
-    assert result.startswith("Rejected:")
     assert switch.batches == []
 
 
@@ -3027,9 +2575,9 @@ def test_precheck_refuses_unparseable_oid_in_view() -> None:
     assert switch.batches == []
 
 
-@pytest.mark.parametrize("mask", ["ff:00", "fe", "1.0.1", "7f", "0"])
+@pytest.mark.parametrize("mask", ["fc", "fd", "1.0.1", "7f", "0"])
 def test_precheck_read_view_refuses_partial_mask(mask: str) -> None:
-    """Redy: a wildcard mask is never safe, in the read-view precheck either."""
+    """A wildcard mask is never safe, in the read-view precheck either."""
     switch = FakeSwitch()
     switch.views.append(("rv", "1.3.6.1.2.1.2", "included", mask))
     result = _run_on(switch, "snmp_view_create", "rv", "power-ethernet")
@@ -3038,77 +2586,22 @@ def test_precheck_read_view_refuses_partial_mask(mask: str) -> None:
     assert switch.batches == []
 
 
-@pytest.mark.parametrize("mask", ["", "ff", "1.1.1", "FF:FF"])
-def test_precheck_read_view_accepts_exact_mask(mask: str) -> None:
+@pytest.mark.parametrize("mask", ["", "1", "ff", "fe", "1.1.1", "FF:FF", "ff:00"])
+def test_precheck_read_view_accepts_full_mask(mask: str) -> None:
     switch = FakeSwitch()
     switch.views.append(("rv", "1.3.6.1.2.1.2", "included", mask))
     result = _run_on(switch, "snmp_view_create", "rv", "power-ethernet")
     assert result.startswith("Configuration sent:"), result
 
 
-@pytest.mark.parametrize("mask", ["ff:00", "fe"])
-def test_write_view_target_refuses_partial_mask(poe_env: None, mask: str) -> None:
+@pytest.mark.parametrize("mask", ["ff:7f", "fc"])
+def test_write_view_target_refuses_partial_mask(mask: str) -> None:
     switch = FakeSwitch()
-    switch.views.append(("wv", f"{ADMIN_COL}.110", "excluded", mask))
-    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
+    switch.views.append(("wv", ADMIN_COL, "included", mask))
+    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAlias")
     assert result.startswith("Rejected:")
     assert "unrecognised mask" in result
     assert switch.batches == []
-
-
-def test_masked_exclusion_does_not_count_in_write_view_check(poe_env: None) -> None:
-    listing = _views(
-        _view_block("wv", f"{ADMIN_COL}.110", "excluded", mask="ff:00"),
-        _view_block("wv", f"{ADMIN_COL}.124", "excluded"),
-        _view_block("wv", ADMIN_COL, "included"),
-    )
-    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "wv", LIVE_ADMIN_EXCL)
-    assert not ok
-    assert "unrecognised mask" in note
-
-
-@pytest.mark.parametrize(
-    "spelling", ["iso.3.6.1.2.1.105", ".1.3.6.1.2.1.105", "1.3.6.1.2.1.105."]
-)
-def test_whole_poe_mib_in_any_spelling_is_not_write_safe(poe_env: None, spelling: str) -> None:
-    listing = _views(
-        *(_view_block("wv", oid, "excluded") for oid in LIVE_ADMIN_EXCL + LIVE_POE_EXCL),
-        _view_block("wv", spelling, "included"),
-    )
-    ok, note = view_is_write_safe(
-        parse_snmp_viewtree(listing), "wv", LIVE_ADMIN_EXCL + LIVE_POE_EXCL
-    )
-    assert not ok
-    assert "whole POWER-ETHERNET-MIB" in note
-
-
-def test_exclusions_in_other_spelling_count_in_write_view_check(poe_env: None) -> None:
-    listing = _views(
-        _view_block("wv", f".{ADMIN_COL}.110", "excluded"),
-        _view_block("wv", f"iso.{ADMIN_COL[2:]}.124", "excluded"),
-        _view_block("wv", f"{ADMIN_COL}.", "included"),
-    )
-    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "wv", LIVE_ADMIN_EXCL)
-    assert ok, note
-
-
-def test_read_view_restricted_check_normalizes_and_refuses_unknown() -> None:
-    ok, _ = view_is_restricted(
-        parse_snmp_viewtree(_view_block("rv", "iso.3.6.1.2.1.105", "included")), "rv"
-    )
-    assert ok
-    ok, note = view_is_restricted(
-        parse_snmp_viewtree(_view_block("rv", ".1", "included")), "rv"
-    )
-    assert not ok and "broad subtree" in note
-    ok, note = view_is_restricted(
-        parse_snmp_viewtree(_view_block("rv", ".iso", "included")), "rv"
-    )
-    assert not ok and "unrecognised OID format" in note
-    ok, note = view_is_restricted(
-        parse_snmp_viewtree(_view_block("rv", "mib-2.105", "included")), "rv"
-    )
-    assert not ok and "unrecognised OID format" in note
 
 
 def test_snmp_view_create_readback_matches_normalized_oid() -> None:
@@ -3125,211 +2618,8 @@ def test_snmp_view_create_readback_matches_normalized_oid() -> None:
     assert "Read-back check: view rv includes 1.3.6.1.2.1.105." in result
 
 
-# ---------------------------------------------------------------------------
-# Cody's retest of d4014b4 (r8.py): staged rollback. The include is removed
-# and verified first; an exclusion is never removed while an included
-# subtree it protects is still in the view.
-# ---------------------------------------------------------------------------
-
-
-def _has_wv(switch: FakeSwitch, oid: str, types: set[str]) -> bool:
-    return any(
-        v[0] == "wv" and canonical_oid(v[1]) == oid and v[2] in types for v in switch.views
-    )
-
-
-def _excl_removals(switch: FakeSwitch) -> list[str]:
-    return [cmd for cmd in switch.sent if cmd.startswith("no ") and "." in cmd.split()[-1]
-            and cmd.split()[-1] not in WRITE_COLUMNS]
-
-
-WRITE_COLUMNS = {ADMIN_COL, ALIAS_COL, POE_COL}
-
-
-def test_r8_a_first_exclusion_refused(poe_env: None) -> None:
-    switch = FakeSwitch(refuse=lambda cmd: cmd == f"snmp view wv {ADMIN_COL}.110 excluded")
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert switch.batches[0] == [f"snmp view wv {ADMIN_COL}.110 excluded"]
-    assert result.startswith("Error: Exclusions were not applied")
-    assert "Rolled back" in result and "ROLLBACK NOT VERIFIED" not in result
-    assert not any(cmd.endswith(" included") for cmd in switch.sent)
-    assert switch.snapshot() == before
-
-
-class _TimeoutAfterFirstExclusion(FakeSwitch):
-    def send_config_set(self, commands: list[str], **kwargs: Any) -> str:
-        if commands and not commands[0].startswith("no "):
-            self.kwargs.append(kwargs)
-            self.batches.append([commands[0]])
-            self._apply(commands[0])
-            raise TimeoutError("simulated mid-send timeout after first exclude")
-        return super().send_config_set(commands, **kwargs)
-
-
-def test_r8_d_timeout_mid_exclusions(poe_env: None) -> None:
-    switch = _TimeoutAfterFirstExclusion()
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert "Exclusions were not applied" in result
-    assert "simulated mid-send timeout" in result
-    assert f"no snmp view wv {ADMIN_COL}.110" in switch.sent
-    assert not any(cmd.endswith(" included") for cmd in switch.sent)
-    assert "Rolled back" in result
-    assert switch.snapshot() == before
-
-
-class _TimeoutAfterInclude(FakeSwitch):
-    def send_config_set(self, commands: list[str], **kwargs: Any) -> str:
-        if commands and commands[0].endswith(" included"):
-            self.kwargs.append(kwargs)
-            self.batches.append(list(commands))
-            self._apply(commands[0])
-            raise TimeoutError("timeout after include was applied")
-        return super().send_config_set(commands, **kwargs)
-
-
-def test_r8_e4_timeout_after_include_applied(poe_env: None) -> None:
-    switch = _TimeoutAfterInclude()
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert "Configuration was sent, verification failed" in result
-    assert "Rolled back" in result
-    assert switch.batches[-2] == [f"no snmp view wv {POE_COL}"]
-    assert switch.snapshot() == before
-
-
-def test_r8_f1_all_rollback_commands_refused(poe_env: None) -> None:
-    switch = FakeSwitch(
-        refuse=lambda cmd: cmd.endswith(" included") or cmd.startswith("no snmp view")
-    )
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert "ROLLBACK NOT VERIFIED" in result
-    assert "do not bind a community" in result
-    assert not _has_wv(switch, POE_COL, {"included"})
-    assert all(_has_wv(switch, o, {"excluded"}) for o in LIVE_ADMIN_EXCL + LIVE_POE_EXCL)
-
-
-def _f2_switch() -> FakeSwitch:
-    """Bound-like write view; the include lands, then a PoE exclusion is lost,
-    and the switch refuses to remove the PoE include again."""
-    switch = FakeSwitch(views=[("iso", "1", "included"), *_ADMIN_WV])
-    original = switch._apply
-
-    def lose_poe_exclusion(cmd: str) -> None:
-        original(cmd)
-        if cmd.endswith(" included"):
-            switch.views = [v for v in switch.views if v[1] != f"{POE_COL}.1.10"]
-
-    switch._apply = lose_poe_exclusion  # type: ignore[method-assign]
-    switch.refuse = lambda cmd: cmd == f"no snmp view wv {POE_COL}"
-    return switch
-
-
-def test_r8_f2_refused_include_removal_keeps_all_exclusions(poe_env: None) -> None:
-    """Critical (r8.py F2): PoE include stays -> its exclusions must stay too."""
-    switch = _f2_switch()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert _has_wv(switch, POE_COL, {"included"})  # the device refused to remove it
-    assert _has_wv(switch, f"{POE_COL}.1.24", {"excluded"})
-    assert all(_has_wv(switch, o, {"excluded"}) for o in LIVE_ADMIN_EXCL)
-    assert _excl_removals(switch) == []
-    assert switch.batches[-1] == [f"no snmp view wv {POE_COL}"]
-    assert "ROLLBACK NOT VERIFIED" in result
-    assert f"included column {POE_COL} is still present" in result
-    assert "exclusions were kept" in result
-    assert "communities already bound to this view may be affected" in result
-
-
-def test_r8_f2_unclear_readback_after_include_removal_keeps_exclusions(poe_env: None) -> None:
-    switch = FakeSwitch(refuse=lambda cmd: cmd.endswith(" included"))
-    from netmiko_mcp_linksys import server
-
-    real_read = server._read_views
-
-    def flaky_read(conn: Any) -> Any:
-        if switch.sent and switch.sent[-1] == f"no snmp view wv {POE_COL}":
-            raise TimeoutError("viewtree read-back timed out")
-        return real_read(conn)
-
-    with patch.object(server, "_read_views", side_effect=flaky_read):
-        result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert "ROLLBACK NOT VERIFIED" in result
-    assert "unclear" in result
-    assert _excl_removals(switch) == []
-    assert all(_has_wv(switch, o, {"excluded"}) for o in LIVE_ADMIN_EXCL + LIVE_POE_EXCL)
-
-
-def test_r8_f3_preexisting_exclusions_survive_include_failure(poe_env: None) -> None:
-    switch = FakeSwitch(
-        views=[("iso", "1", "included"), *_ADMIN_WV],
-        refuse=lambda cmd: cmd.endswith(" included"),
-    )
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert not any(
-        cmd.startswith("no ") and any(e in cmd for e in LIVE_ADMIN_EXCL) for cmd in switch.sent
-    )
-    assert "Rolled back" in result
-    assert switch.snapshot() == before
-
-
-def test_r8_f4_preexisting_exclusions_in_other_spelling_are_not_new(poe_env: None) -> None:
-    views = [
-        ("iso", "1", "included"),
-        ("wv", f"iso.{ADMIN_COL[2:]}.110", "excluded"),
-        ("wv", f".{ADMIN_COL}.124", "excluded"),
-        ("wv", f"iso.{ADMIN_COL[2:]}", "included"),
-    ]
-    switch = FakeSwitch(views=views, refuse=lambda cmd: cmd.endswith(" included"))
-    before = switch.snapshot()
-    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAlias")
-    assert not any(" excluded" in cmd for cmd in switch.sent)
-    assert not any(cmd.startswith("no ") and ADMIN_COL in cmd for cmd in switch.sent)
-    assert "Rolled back" in result
-    assert switch.snapshot() == before
-
-
-class _RollbackBoom(FakeSwitch):
-    def send_config_set(self, commands: list[str], **kwargs: Any) -> str:
-        if commands and commands[0].startswith("no "):
-            self.kwargs.append(kwargs)
-            self.batches.append(list(commands))
-            raise TimeoutError("rollback send timeout")
-        return super().send_config_set(commands, **kwargs)
-
-
-def test_r8_f5_rollback_send_raises(poe_env: None) -> None:
-    switch = _RollbackBoom(refuse=lambda cmd: cmd.endswith(" included"))
-    result = _run_on(switch, "snmp_write_view_create", "wv", "ifAdminStatus")
-    assert "ROLLBACK NOT VERIFIED" in result
-    assert "do not bind a community" in result
-    assert not _has_wv(switch, ADMIN_COL, {"included"})
-    assert all(_has_wv(switch, o, {"excluded"}) for o in LIVE_ADMIN_EXCL)
-
-
-def test_rollback_never_removes_exclusion_protecting_included_column(poe_env: None) -> None:
-    """General rule: the view already includes ifAdminStatus but lacks the
-    0/24 exclusion; this call adds it, then fails. That exclusion stays."""
-    switch = FakeSwitch(
-        views=[
-            ("iso", "1", "included"),
-            ("wv", f"{ADMIN_COL}.110", "excluded"),
-            ("wv", ADMIN_COL, "included"),
-        ],
-        refuse=lambda cmd: cmd == f"snmp view wv {POE_COL}.1.24 excluded",
-    )
-    result = _run_on(switch, "snmp_write_view_create", "wv", "pethPsePortAdminEnable")
-    assert f"no snmp view wv {ADMIN_COL}.124" not in switch.sent
-    assert f"no snmp view wv {POE_COL}.1.10" in switch.sent
-    assert _has_wv(switch, f"{ADMIN_COL}.124", {"excluded"})
-    assert not any(cmd.endswith(" included") for cmd in switch.sent)
-    assert "ROLLBACK NOT VERIFIED" in result
-    assert f"Kept exclusion(s) {ADMIN_COL}.124" in result
-
-
-def test_r8_g3_iso_dot_one_write_column_is_refused() -> None:
-    """Live question resolved fail-closed: iso.1.3.6... is unreadable, not 1.1.3.6..."""
+def test_iso_dot_one_write_column_is_refused() -> None:
+    """iso.1.3.6... is unreadable, not 1.1.3.6... (fail-closed)."""
     assert oid_arcs("iso.1.3.6.1.2.1.2.2.1.7") is None
     switch = FakeSwitch(views=[("iso", "1", "included"), ("wv", "iso.1.3.6.1.2.1.2.2.1.7", "included")])
     result = _run_on(switch, "snmp_view_create", "wv", "power-ethernet")
@@ -3338,26 +2628,69 @@ def test_r8_g3_iso_dot_one_write_column_is_refused() -> None:
     assert switch.batches == []
 
 
-def test_r8_h2_has_entry_uses_exact_view_name() -> None:
-    from netmiko_mcp_linksys.server import _EXCLUDED, _has_entry
-
-    entries = parse_snmp_viewtree(
-        _views(
-            _view_block("WV", f"{ADMIN_COL}.110", "excluded"),
-            _view_block("wv", f"{ADMIN_COL}.124", "excluded"),
-        )
-    )
-    assert _has_entry(entries, "wv", f"{ADMIN_COL}.124", _EXCLUDED)
-    assert not _has_entry(entries, "wv", f"{ADMIN_COL}.110", _EXCLUDED)
-
-
 def test_only_rollback_removes_view_entries() -> None:
-    """No tool except the write-view rollback sends 'no snmp view'."""
+    """No code except the write-view rollback builds a 'no snmp view' command."""
     import inspect
 
     import netmiko_mcp_linksys.snmp_cli as cli
-    from netmiko_mcp_linksys import server
+    from netmiko_mcp_linksys import connection, server
 
-    source = inspect.getsource(server) + inspect.getsource(cli)
-    sites = [line.strip() for line in source.splitlines() if 'f"no snmp view' in line]
-    assert sites == ['conn, [f"no snmp view {view_name} {oid}" for oid in oids], **kwargs']
+    source = "\n".join(inspect.getsource(m) for m in (server, cli, connection))
+    # String literals only (docstrings use ``no snmp view``), any spacing,
+    # and a split ["no", "snmp", ...] construction.
+    pattern = _re.compile(r"""["']no\s+snmp\s+view|["']no["']\s*,\s*["']snmp""")
+    sites = [line.strip() for line in source.splitlines() if pattern.search(line)]
+    assert sites == [
+        'conn, [f"no snmp view {view_name} {oid}"], error_pattern=CONFIG_ERROR_PATTERN'
+    ]
+
+
+# ---------------------------------------------------------------------------
+# What is left of the port protection: the tools refuse to switch off the
+# protected ports (production: 0/10 Unraid via PoE splitter, 0/24 uplink).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("port", ["0/10", "0/24"])
+def test_tools_refuse_switching_off_protected_ports(
+    port: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from netmiko_mcp_linksys.server import poe_set, port_set_admin_state
+
+    monkeypatch.setenv("SWITCH_PROTECTED_PORTS", "0/10,0/24")
+    with patch("netmiko_mcp_linksys.server.run_config_and_readback") as run:
+        admin = port_set_admin_state(port, False)
+        poe = poe_set(port, False)
+    run.assert_not_called()
+    for result in (admin, poe):
+        assert result.startswith("Rejected:")
+        assert f"protected port {port}" in result
+
+
+@pytest.mark.parametrize("value", [None, "", " , ", "0/24,gi0/10"])
+def test_tools_fail_closed_without_valid_protected_ports(
+    value: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from netmiko_mcp_linksys.server import poe_set, port_set_admin_state
+
+    if value is None:
+        monkeypatch.delenv("SWITCH_PROTECTED_PORTS", raising=False)
+    else:
+        monkeypatch.setenv("SWITCH_PROTECTED_PORTS", value)
+    with patch("netmiko_mcp_linksys.server.run_config_and_readback") as run:
+        admin = port_set_admin_state("0/3", False)
+        poe = poe_set("0/3", False)
+    run.assert_not_called()
+    assert admin.startswith("Rejected:") and poe.startswith("Rejected:")
+
+
+def test_port_0_15_is_not_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """0/15 (EoC converter with Zigbee router) is a README note, not a lock."""
+    from netmiko_mcp_linksys.server import poe_set
+
+    monkeypatch.setenv("SWITCH_PROTECTED_PORTS", "0/10,0/24")
+    with patch(
+        "netmiko_mcp_linksys.server.run_config_and_readback", return_value="done"
+    ) as run:
+        assert poe_set("0/15", False) == "done"
+    run.assert_called_once()

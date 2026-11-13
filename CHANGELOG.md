@@ -26,21 +26,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) and
   `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`) for PoE on/off
   from Home Assistant (Vikunja task 48). Whole MIB subtrees are refused.
-  It always sends `snmp view <view> 1.3.6.1.2.1.2.2.1.7.<ifIndex>
-  excluded` for each protected port and, for a view with PoE,
-  `snmp view <view> 1.3.6.1.2.1.105.1.1.1.3.<group>.<port> excluded` for
-  each protected PoE port, all before the included column.
-- `SWITCH_SNMP_PROTECTED_IFINDEXES` (`port=ifIndex,…`): explicit ifIndex
-  values for exactly the ports in `SWITCH_PROTECTED_PORTS`. The ifIndex
-  is never derived from the port number; without a valid mapping every
-  write-view and RW operation refuses (fail-closed).
-- `SWITCH_SNMP_PROTECTED_POE_INDEXES` (`port=<group>.<port>,…`): explicit
-  pethPsePortTable indexes for exactly the PoE ports (`0/1`–`0/24`) of
-  `SWITCH_PROTECTED_PORTS`. Never derived from the port number; without
-  a valid mapping (unset, empty, malformed, duplicate, missing or extra
-  ports) every write view with PoE is refused (fail-closed). 0/15 (EoC
-  converter feeding the Zigbee router) is documented in the README as
-  "do not turn PoE off", not locked.
+  It sends one `snmp view <view> <column> included` line with
+  `error_pattern="%"`, verifies it in `show snmp viewtree`, and on any
+  failure removes the column again and checks that the viewtree equals
+  the state before (else `ROLLBACK NOT VERIFIED`). There are no per-port
+  exclusions: the protected ports (`SWITCH_PROTECTED_PORTS`, production
+  0/10 and 0/24) are refused by the tools only, not at SNMP level
+  (Roland, 2026-11-13). Anyone with the write community can switch them
+  directly over SNMP; the README says so. 0/15 (EoC converter feeding the
+  Zigbee router) is documented as "do not turn PoE off", not locked.
+- The `show snmp viewtree` parser reads the layout from Redy's read-only
+  check (`Subtree OID  : 1` / `Subtree Mask : 1` / `View Type    :
+  Included`) and starts a new entry at every `View Name` line, so blank
+  line separated blocks work too. Masks are read per RFC 3415: a full
+  mask such as `1`, `1.1.1` or `ff:e0` (11-arc column) is exact, a mask
+  with a 0 inside the OID length is a wildcard and refused.
 
 ### Changed
 
@@ -51,35 +51,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before sending, and after sending the access entry must name exactly
   the requested views.
 - The `show snmp viewtree` read-back now verifies write views strictly
-  (explicit included/excluded type, all-ones or empty mask, only
-  write-allowed columns, every ifAdminStatus exclusion present, and every
-  PoE exclusion present when the view includes pethPsePortAdminEnable)
-  in `snmp_community_create` and `snmp_community_remove`. Read and
+  (explicit included/excluded type, exact mask, only write-allowed
+  columns) in `snmp_community_create` and `snmp_community_remove`. Read and
   write views with an unrecognised (possibly wildcard) mask are refused.
 - `snmp_view_create` refuses any subtree for a view that is used as a
-  write view or carries protected-port exclusions (whole MIBs would
+  write view or holds a writable column or an excluded entry (whole MIBs would
   widen the column-only write view), and now runs in a
   single session with the "Configuration was sent, verification failed"
   wrapper for post-send read-back errors.
 
 ### Security
 
-- Write views change all-or-nothing (Cody, review of bc96149). The
-  missing exclusions are sent first with `error_pattern="%"` and verified
-  in `show snmp viewtree`; the included column is sent only after that,
-  and verified again. On any failure (refused line, silently missing
-  entry, failed read-back) this call's entries are removed with
-  `no snmp view <view> <oid>` and the viewtree must equal the state
-  before, else the result says `ROLLBACK NOT VERIFIED`. Before, one
-  batch sent the include even if an exclusion was refused.
-- The write-view rollback is staged (Cody, retest of d4014b4). The
-  included column of this call is removed first and verified; if it is
-  still there or the read-back is unclear, the rollback stops, keeps all
-  exclusions and reports `ROLLBACK NOT VERIFIED` (bound communities may
-  be affected). Only then this call's exclusions are removed, and never
-  one that still protects an included column. Before, one batch removed
-  the column and the exclusions, so a refused column removal left
-  `pethPsePortAdminEnable` writable without its PoE exclusions.
+- Removed again before release (Roland, 2026-11-13): the view-level
+  exclusions of the protected ports, `SWITCH_SNMP_PROTECTED_IFINDEXES`,
+  `SWITCH_SNMP_PROTECTED_POE_INDEXES` and the two-stage
+  exclusion/include apply with its staged rollback. They needed live
+  ifIndex and PoE index mappings that the tools cannot read. What stays:
+  the tool-level port lock, `error_pattern="%"`, read-back verification
+  with rollback of the added column, the central OID normalization and
+  `SWITCH_SNMP_WRITE_ENABLED` off by default.
 - `oid_arcs` accepts a leading `iso` only as `iso.3…`; `iso.1.3.6…`, a
   bare `iso` and other variants are refused (fail-closed) instead of
   being read as `1.1.3.6…`.
@@ -87,20 +77,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for all view checks, prechecks and read-backs: leading dot, `iso`,
   trailing dots and whitespace are accepted, prefixes are compared by
   whole arcs, and unknown formats or partial (wildcard) masks are refused,
-  also in the read-view precheck. Before, `.1.3.6…` or `iso.3.6…`
-  exclusions hid a write view from `snmp_view_create`, so the whole
-  POWER-ETHERNET-MIB could be added to it (Cody). The read-view precheck
-  now refuses any view with excluded entries or writable columns.
+  also in the read-view precheck. Before, other OID spellings could hide
+  a write view from `snmp_view_create`, so the whole POWER-ETHERNET-MIB
+  could be added to it (Cody). The read-view precheck now refuses any
+  view with excluded entries or writable columns.
 - SNMP view names are compared exactly (case-sensitive) in all view
   checks (`view_is_restricted`, `view_is_write_safe`, the read-back
   checks, and the PoE/write-view prechecks). A view name that differs
   from an existing view only in letter case is refused (fail-closed),
   because it is not live-confirmed whether ISS treats view names
-  case-sensitively. Before, `snmp_view_create("wv")` plus
-  `snmp_write_view_create("WV")` let a community with write view `wv`
-  pass the write-view check through the exclusions of `WV`, so the
-  ifAdminStatus of the protected ports could have been writable (found
-  by Cody). `snmp_view_create` now reads `show snmp viewtree` before
+  case-sensitively (found by Cody). `snmp_view_create` now reads `show snmp viewtree` before
   sending and refuses if it cannot be parsed.
 
 - SNMP community rejection paths return only a generic message (no device

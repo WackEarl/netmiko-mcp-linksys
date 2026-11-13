@@ -51,8 +51,6 @@ package is installed in that environment.
 | `SWITCH_USER` | yes (at tool call) | SSH username. |
 | `SWITCH_PASSWORD` | yes (at tool call) | SSH password. Never logged or returned. |
 | `SWITCH_SNMP_COMMUNITY` | yes before `snmp_community_create` / `snmp_community_remove` | SNMPv2c community string for the new, non-default community. Never a tool argument, never logged or returned (shown as `[REDACTED]`). Must not be `public` or `private`; 8–32 characters from `[A-Za-z0-9_]` (no dots or dashes). An invalid value is not used for redaction. |
-| `SWITCH_SNMP_PROTECTED_IFINDEXES` | yes before `snmp_write_view_create`, `snmp_community_create(..., "rw", ...)`, and `snmp_community_remove` while the configured community has write access | Explicit `port=ifIndex` pairs, e.g. `0/10=<ifIndex>,0/24=<ifIndex>`. Must list **exactly** the ports in `SWITCH_PROTECTED_PORTS`, each with a unique ifIndex (1..2147483647, no leading zeros). Every write view gets `snmp view <view> 1.3.6.1.2.1.2.2.1.7.<ifIndex> excluded` (ifAdminStatus) for each entry, sent before any included column. The ifIndex is **never** derived from the port number: the LGS328PC mapping is not confirmed, so Redy must read it live (IF-MIB `ifDescr` / `ifName` walk) before setting this. Unset, empty, malformed, duplicate, missing, or extra entries make every write-view / RW operation refuse (fail-closed). Read-only communities do not need it. |
-| `SWITCH_SNMP_PROTECTED_POE_INDEXES` | yes before a write view gets `pethPsePortAdminEnable` (`snmp_write_view_create`), and for `snmp_community_create(..., "rw", ...)` / `snmp_community_remove` when the write view includes it | Explicit `port=<group>.<port>` pairs (pethPsePortTable index `pethPsePortGroupIndex.pethPsePortIndex`), e.g. `0/10=<group>.<port>,0/24=<group>.<port>`. Must list **exactly** the PoE ports (`0/1`–`0/24`) of `SWITCH_PROTECTED_PORTS`, each with a unique index of two positive integers (1..2147483647, no leading zeros); non-PoE protected ports such as `0/25` have no PoE row and must not be listed. A write view with PoE gets `snmp view <view> 1.3.6.1.2.1.105.1.1.1.3.<group>.<port> excluded` for each entry, sent before the included column. The index is **never** derived from the port number or ifIndex: Redy must read it live (walk `pethPsePortTable`). Unset, empty, malformed, duplicate, missing, or extra entries refuse any write view with PoE (fail-closed). Write views without PoE do not need it. |
 | `SWITCH_SNMP_WRITE_ENABLED` | yes (`1`) before any SNMP write tool | Hard gate, **off by default**. SNMP write tools refuse unless this is exactly `1`. Leave it unset until Redy has confirmed the CLI syntax live. |
 | `SWITCH_DEVICE_TYPE` | no | netmiko device type. Default: `cisco_s300`. |
 | `SWITCH_KNOWN_HOSTS` | yes (at tool call) | Path to an OpenSSH `known_hosts` file with the switch host key. System host keys are not used. |
@@ -89,8 +87,6 @@ until it is set to a valid list, disable and PoE-off are refused.
       "SWITCH_USER": "${SWITCH_USER}",
       "SWITCH_PASSWORD": "${SWITCH_PASSWORD}",
       "SWITCH_SNMP_COMMUNITY": "${SWITCH_SNMP_COMMUNITY}",
-      "SWITCH_SNMP_PROTECTED_IFINDEXES": "${SWITCH_SNMP_PROTECTED_IFINDEXES}",
-      "SWITCH_SNMP_PROTECTED_POE_INDEXES": "${SWITCH_SNMP_PROTECTED_POE_INDEXES}",
       "SWITCH_SNMP_WRITE_ENABLED": "1",
       "SWITCH_DEVICE_TYPE": "cisco_s300",
       "SWITCH_KNOWN_HOSTS": "/config/netmiko/known_hosts",
@@ -136,9 +132,9 @@ Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 | `poe_set(port, enabled)` | `interface gigabitethernet 0/N` then `power inline enable` / `power inline disable`. PoE ports: `0/1`–`0/24`. | no |
 | `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back of `show interfaces description` for that port (verified, quoted, empty, probably truncated, or could not verify). | no |
 | `save_config()` | Privileged exec `save` only. Gate this in the hub with `unlock`. | yes |
-| `snmp_view_create(view_name, subtree)` | Add one **included** subtree from a fixed OID allowlist (`interfaces`, `ifmib`, `power-ethernet`) to a **read** view. Refused for a view that is used as a write view or carries protected-port exclusions. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
-| `snmp_write_view_create(view_name, subtree)` | Add one writable column to a **write** view: `ifAdminStatus` (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) or `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`, PoE on/off). Sends the ifAdminStatus exclusions from `SWITCH_SNMP_PROTECTED_IFINDEXES` and, for a view with PoE, the pethPsePortAdminEnable exclusions from `SWITCH_SNMP_PROTECTED_POE_INDEXES` first, then the included column, all-or-nothing with rollback (see below). Whole MIB subtrees are never allowed. Strict read-back; refuses without the index mappings. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
-| `snmp_community_create(view_name, access, write_view=None)` | Create a v2c community from `SWITCH_SNMP_COMMUNITY` bound to an existing restricted read view (`view_name`). `ro`: write view `none`. `rw`: requires a separate `write_view` that passes the write-view check (including the PoE exclusions if it has PoE). The secret is never a tool argument. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_view_create(view_name, subtree)` | Add one **included** subtree from a fixed OID allowlist (`interfaces`, `ifmib`, `power-ethernet`) to a **read** view. Refused for a view that is used as a write view or holds a writable column or an excluded entry. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_write_view_create(view_name, subtree)` | Add one writable column to a **write** view: `ifAdminStatus` (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) or `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`, PoE on/off). One `snmp view <view> <column> included` line, sent with a `%` error check and verified in `show snmp viewtree`; on failure it is removed again (see below). Whole MIB subtrees are never allowed. **No per-port exclusions:** the column is writable for every port, protected ports included. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_community_create(view_name, access, write_view=None)` | Create a v2c community from `SWITCH_SNMP_COMMUNITY` bound to an existing restricted read view (`view_name`). `ro`: write view `none`. `rw`: requires a separate `write_view` that passes the write-view check (only writable columns). The secret is never a tool argument. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 | `snmp_community_remove(name)` | Remove `public` or `private` only, and only after the configured community is verified present with a restricted view. Never removes the configured community. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 | `snmp_user_remove(name)` | Remove `noAuthUser` only. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 
@@ -272,8 +268,7 @@ Suggested order, each call unlock-gated:
 2. `snmp_view_create("<view>", "ifmib")` — OID `1.3.6.1.2.1.31`
 3. `snmp_view_create("<view>", "power-ethernet")` — OID
    `1.3.6.1.2.1.105`, so HA can read PoE state and budget
-4. For `rw` only, after Redy has set `SWITCH_SNMP_PROTECTED_IFINDEXES`
-   (and, for PoE, `SWITCH_SNMP_PROTECTED_POE_INDEXES`):
+4. For `rw` only:
    `snmp_write_view_create("<view>_w", "ifAdminStatus")`,
    `snmp_write_view_create("<view>_w", "ifAlias")` and, for PoE
    switching, `snmp_write_view_create("<view>_w", "pethPsePortAdminEnable")`
@@ -287,7 +282,7 @@ Suggested order, each call unlock-gated:
 7. `snmp_user_remove("noAuthUser")`
 8. `save_config` when you are ready to persist
 
-### Read/write view split and protected-port exclusions
+### Read/write view split
 
 A RW community never writes through its read view. `snmp access` names a
 separate write view (manual p. 103: `read <ReadView | none> write
@@ -297,58 +292,59 @@ columns. A write view passes the check (before
 binding, after `snmp_write_view_create`, after `snmp_community_create`,
 and before `snmp_community_remove`) only if, in `show snmp viewtree`:
 
-- every entry of the view has an explicit `included` / `excluded` type
-  and no mask, or an all-ones mask (`1`, `1.1…`, `ff`, `ff:ff…`);
-  anything else could be a wildcard and is refused;
-- its included subtrees are only the columns `1.3.6.1.2.1.2.2.1.7`
-  (ifAdminStatus), `1.3.6.1.2.1.31.1.1.1.18` (ifAlias) and
-  `1.3.6.1.2.1.105.1.1.1.3` (pethPsePortAdminEnable), never a whole MIB
-  such as `1.3.6.1.2.1.2` or `1.3.6.1.2.1.105`;
-- it has an `excluded` entry `1.3.6.1.2.1.2.2.1.7.<ifIndex>` for every
-  entry in `SWITCH_SNMP_PROTECTED_IFINDEXES`;
-- if it includes pethPsePortAdminEnable, it also has an `excluded` entry
-  `1.3.6.1.2.1.105.1.1.1.3.<group>.<port>` for every entry in
-  `SWITCH_SNMP_PROTECTED_POE_INDEXES` (and that variable must be valid);
+- every entry of the view has an explicit `included` / `excluded` type,
+  an OID in a known format and an exact mask (see below);
+- it includes at least one subtree, and its included subtrees are only
+  the columns `1.3.6.1.2.1.2.2.1.7` (ifAdminStatus),
+  `1.3.6.1.2.1.31.1.1.1.18` (ifAlias) and `1.3.6.1.2.1.105.1.1.1.3`
+  (pethPsePortAdminEnable), never a whole MIB such as `1.3.6.1.2.1.2` or
+  `1.3.6.1.2.1.105` and never an instance;
 - it is not the same view as the read view.
 
-`snmp_write_view_create` changes a write view all-or-nothing, in two
-stages, each sent with netmiko `error_pattern="%"` (ISS error lines start
-with `%`, and netmiko stops at the first one):
+Excluded entries (for example from an older build) only narrow a view and
+are accepted, but none are required or sent.
 
-1. Only the exclusions that are not there yet are sent, then
-   `show snmp viewtree` must show every required exclusion. If a line is
-   refused, or an exclusion is silently missing, the exclusions sent by
-   this call are removed again and the included column is **never sent**.
-2. Only then the included column is sent, and the whole write view is
-   checked again. On any error the change is rolled back in two steps.
-
-The rollback follows one rule: an exclusion is never removed while an
-included subtree it protects is still in the view.
-
-1. If this call added the included column, only that column is removed
-   (`no snmp view <view> <oid>`) and `show snmp viewtree` is read back.
-   If it is still there, or the read-back is unclear, the rollback stops
-   at once, keeps every exclusion and says `ROLLBACK NOT VERIFIED`.
-   Communities already bound to that view may be affected; check
-   `show snmp group access`.
-2. Only then this call's exclusions are removed, except any that still
-   protect an included column of the view (those are kept and named).
-
-After a rollback `show snmp viewtree` must match the state before the
-call exactly; otherwise the result says `ROLLBACK NOT VERIFIED` and the
-view must not be bound to a community. Exclusions that existed before the
-call are never removed. The write-view rollback is the only place that
-sends `no snmp view`; no tool removes view entries otherwise.
+`snmp_write_view_create` sends one line, `snmp view <view> <column>
+included`, with netmiko `error_pattern="%"` (ISS error lines start with
+`%`), then reads `show snmp viewtree` back and runs the check above. If
+the column was already there, nothing is sent. On any error after
+sending, the column added by this call is removed again (`no snmp view
+<view> <column>`) and `show snmp viewtree` must match the state before
+the call exactly; otherwise the result says `ROLLBACK NOT VERIFIED` and
+the view must not be bound to a community. A column that existed before
+the call is never removed. The rollback is the only place that sends
+`no snmp view`.
 
 OIDs from `show snmp viewtree` go through one normalization
 (`oid_arcs`): whitespace, one leading dot, a leading `iso` (= `1`, only
 when followed by `3`) and trailing dots are accepted, so `.1.3.6.1…`,
 `iso.3.6.1…` and `1.3.6.1…` are the same OID; `iso.1.3.6.1…`, a bare
 `iso` and other variants are refused instead of reinterpreted. Prefixes are compared by whole arcs, so
-`1.3.6.1.2.1.105` is not below `1.3.6.1.2.1.10`. Any other format, and
-any entry with a mask that is not empty or all-ones (a possible
-wildcard), makes the check refuse (fail-closed), in the read-view
-precheck as well.
+`1.3.6.1.2.1.105` is not below `1.3.6.1.2.1.10`. Any other format makes
+the check refuse (fail-closed), in the read-view precheck as well.
+
+Masks follow RFC 3415: bit *n* belongs to sub-identifier *n*, a missing
+or short mask is extended with ones, and bits beyond the OID length do
+not matter. A mask is exact when every bit that covers an arc of the OID
+is 1. Accepted spellings: empty / `none` / `-`, dotted bits (`1`,
+`1.1.1`) and hex octets (`ff`, `ff:e0`, `0xffe0`). So the full mask the
+switch prints (`Subtree Mask : 1` in Redy's read check) and a hex mask
+such as `ff:e0` for an 11-arc column are accepted, while a mask with a 0
+inside the OID (a wildcard, such as `ff:c0` for an 11-arc OID) is
+refused.
+
+The viewtree parser reads the layout from Redy's read-only check:
+
+```
+View Name    : iso
+Subtree OID  : 1
+Subtree Mask : 1
+View Type    : Included
+```
+
+(no leading dot, no `iso.`, with a mask; the views on the switch are
+`iso` and `restricted`). Blocks are split on `-----` lines and before
+every `View Name` line, so blank-line separated blocks work too.
 
 After a create, the access entry must name exactly the requested read and
 write views. A failed check before sending refuses; after sending it is
@@ -366,12 +362,7 @@ on or off with `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`)
 through the write view (decision in Vikunja task 48). Only that PoE
 column is writable, never the whole PoE MIB.
 
-Port 0/10 powers the Unraid server through a PoE splitter and 0/24 is
-the uplink, so the write view always excludes
-`pethPsePortAdminEnable.<group>.<port>` for the protected PoE ports from
-`SWITCH_SNMP_PROTECTED_POE_INDEXES`, next to their
-`ifAdminStatus.<ifIndex>`. The switch then refuses a SET on those ports
-itself, whatever HA sends. pethPsePortTable is indexed by
+pethPsePortTable is indexed by
 `pethPsePortGroupIndex.pethPsePortIndex`, which need not equal the port
 number or the ifIndex. Whether the LGS328PC implements
 `1.3.6.1.2.1.105` (or only a vendor MIB) is unconfirmed; if it does not,
@@ -387,19 +378,30 @@ view).
 
 ### SNMP and protected ports
 
-`SWITCH_PROTECTED_PORTS` is enforced by the CLI tools
-(`port_set_admin_state`, `poe_set`). Over SNMP, the write view excludes
-`ifAdminStatus.<ifIndex>` for the ports in
-`SWITCH_SNMP_PROTECTED_IFINDEXES` and, if the write view has PoE,
-`pethPsePortAdminEnable.<group>.<port>` for the ports in
-`SWITCH_SNMP_PROTECTED_POE_INDEXES`, so a RW community cannot shut them
-down or cut their PoE — **provided the indexes are correct**. A wrong
-index protects the wrong port; both mappings must be verified live. The
-`ifAlias` of those ports stays writable.
-There is no source-IP / `transporttag` restriction in these tools.
-Treat the community as a secret, restrict UDP/161 at the firewall
-(Redy handles the ACL as a separate work package), and prefer `ro` if
-HA only needs to read counters.
+**The protected ports are only protected at tool level.**
+`SWITCH_PROTECTED_PORTS` (production: `0/10`, which powers the Unraid
+server through a PoE splitter, and `0/24`, the uplink) is enforced by
+the tools of this server: `port_set_admin_state(..., False)` and
+`poe_set(..., False)` refuse those ports, and refuse every port if the
+variable is unset, empty or invalid (fail-closed). This server has no
+tool that writes SNMP values itself.
+
+There is **no** protection at SNMP level (Roland's decision of
+2026-11-13; earlier builds excluded the protected ports in the write
+view, which needed live ifIndex / PoE index mappings). The write view
+makes `ifAdminStatus`, `ifAlias` and `pethPsePortAdminEnable` writable
+for **every** port. Anyone who has the write community can switch off
+0/10 or 0/24 (or cut their PoE) with a direct SNMP SET, past these tools;
+the switch then needs local access to recover. Therefore:
+
+- keep the write community secret and use it only where it is needed
+  (Home Assistant); give everything else a read-only community;
+- keep the write view to the columns that are really used (leave out
+  `pethPsePortAdminEnable` if PoE switching is not needed);
+- restrict UDP/161 at the firewall to the hosts that need it (Redy
+  handles the ACL as a separate work package); these tools set no
+  source-IP / `transporttag` restriction;
+- disable the HA switches for 0/10, 0/24 and 0/15.
 
 ### Live-test checklist (Redy)
 
@@ -410,39 +412,23 @@ HA only needs to read counters.
 - Whether `enable snmpagent` is required first.
 - Exact `show snmp community`, `show snmp viewtree`, `show snmp group`,
   `show snmp group access`, and `show snmp user` layouts (the parsers
-  assume ISS `Key: value` blocks separated by `-----`).
+  assume ISS `Key: value` blocks separated by `-----`; `show snmp
+  viewtree` is confirmed read-only, see above).
 - Exact spelling of the default communities and of `noAuthUser`.
 - `show snmp view` as an alias of `show snmp viewtree` (unconfirmed;
   the manual only documents `viewtree`).
-- SET of `ifAdminStatus` / `ifAlias` with the new view; walk of
-  `1.3.6.1.2.1.105`.
-- **ifIndex mapping** of 0/10 and 0/24 (walk `ifDescr` / `ifName`,
-  `1.3.6.1.2.1.2.2.1.2` / `1.3.6.1.2.1.31.1.1.1.1`) before setting
-  `SWITCH_SNMP_PROTECTED_IFINDEXES`.
+- SET of `ifAlias` with the new view.
 - That refused config lines print an error starting with `%` (the
-  write-view tools stop on it), and that `no snmp view <view> <oid>`
+  write-view tool stops on it), and that `no snmp view <view> <oid>`
   removes exactly that entry (used for rollback).
-- How `show snmp viewtree` prints OIDs (`1.3…`, `.1.3…`, `iso.3…`?);
-  other formats are refused.
-- That `snmp view <view> <oid> excluded` is accepted for an instance OID
-  (`1.3.6.1.2.1.2.2.1.7.<ifIndex>`) without a mask, how
-  `show snmp viewtree` prints the type (`excluded`?) and the mask
-  (empty / `1` / `ff`?), and that a SET of `ifAdminStatus` on a
-  protected port is refused (`noAccess` / `notWritable`) while other
-  ports still work.
-- **PoE index mapping** of 0/10 and 0/24: walk `pethPsePortTable`
-  (`1.3.6.1.2.1.105.1.1`) and match `<group>.<port>` to the ports before
-  setting `SWITCH_SNMP_PROTECTED_POE_INDEXES`; do not assume it equals the
-  port number or the ifIndex.
-- That `snmp view <view> 1.3.6.1.2.1.105.1.1.1.3.<group>.<port>
-  excluded` is accepted for a two-part instance OID, and that the
-  exclusions take effect although they are sent before the included
-  column (RFC 3415: the longest matching subtree wins, so order should
-  not matter, but confirm it on ISS).
-- That a GET/WALK of `1.3.6.1.2.1.105` works with the community, a SET
-  of `pethPsePortAdminEnable` works on a free port (e.g. 0/18), and a
-  SET of `pethPsePortAdminEnable` and `ifAdminStatus` on 0/10 and 0/24 is
-  refused (`noAccess` / `notWritable`). If not, fall back to PoE read-only.
+- How `show snmp viewtree` prints a column OID such as
+  `1.3.6.1.2.1.105.1.1.1.3` and its mask after
+  `snmp_write_view_create` (Redy's read check only showed OID `1` with
+  mask `1`); whether the column is accepted without a mask.
+- That a GET/WALK of `1.3.6.1.2.1.105` works with the community and a
+  SET of `pethPsePortAdminEnable` and `ifAdminStatus` works on a free
+  port (e.g. 0/18). If PoE SET fails, fall back to PoE read-only. Do
+  **not** SET 0/10 or 0/24: nothing at SNMP level stops it.
 - Confirm leftover `public` / `private` / `noAuthUser` are gone, and
   that the session log and tool output never contain the community.
 - Terminal width: `cisco_s300` `session_preparation` already sends
