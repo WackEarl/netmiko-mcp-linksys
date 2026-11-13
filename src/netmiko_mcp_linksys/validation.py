@@ -90,6 +90,19 @@ def valid_community_for_redaction() -> str | None:
         return None
 
 
+# Hostname, optional (config…), then # or > — ISS/Cisco prompt redraws
+# that can land at the start of a wrapped continuation line.
+_PROMPT_REDRAW_RE = re.compile(
+    r"(^|[\r\n])[\w.\-]+(?:\([^)\r\n]*\))?[#>]\s*",
+)
+
+
+def prepare_text_for_redaction(text: str) -> str:
+    """Strip ANSI/control sequences and prompt redraws before secret redaction."""
+    text = strip_controls(text)
+    return _PROMPT_REDRAW_RE.sub(lambda match: match.group(1), text)
+
+
 def redact_community_command_spans(text: str) -> str:
     """Replace a (possibly wrapped) community-config command with a redacted span."""
     return _COMMUNITY_CMD_SPAN_RE.sub(
@@ -130,8 +143,10 @@ def redact_secrets(text: str) -> str:
     (existing behaviour). Community config-line spans are redacted even
     when the secret is wrapped across line breaks. The env community is
     only substituted when it is a valid secret (see
-    valid_community_for_redaction).
+    valid_community_for_redaction). ANSI and prompt redraws are
+    stripped first so a wrap mid-secret can be rejoined.
     """
+    text = prepare_text_for_redaction(text)
     text = redact_community_command_spans(text)
     community = valid_community_for_redaction()
     if community:

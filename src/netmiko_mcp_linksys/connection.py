@@ -19,7 +19,10 @@ from typing import Any
 from netmiko import ConnectHandler
 
 from netmiko_mcp_linksys.output import strip_controls as _strip_controls
-from netmiko_mcp_linksys.snmp_cli import redact_community_listing
+from netmiko_mcp_linksys.snmp_cli import (
+    redact_community_listing,
+    redact_community_name_fields,
+)
 from netmiko_mcp_linksys.validation import (
     ValidationError,
     config_output_is_error,
@@ -129,20 +132,6 @@ def _commands_include_snmp_community(commands: list[str]) -> bool:
     return any(re.search(r"(?i)\bsnmp\s+community\b", command) for command in commands)
 
 
-def _set_terminal_width_best_effort(conn: Any) -> None:
-    """Widen the CLI if the driver supports it, so a community line is less likely to wrap."""
-    setter = getattr(conn, "set_terminal_width", None)
-    if not callable(setter):
-        return
-    try:
-        setter(511)
-    except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
-        warn(
-            f"could not set terminal width ({exc}); continuing.",
-            once_key="term-width",
-        )
-
-
 def redact_show_output(command: str, text: str) -> str:
     """Redact secrets in exec output. Community listings are fully masked."""
     if re.search(r"(?i)\bshow\s+snmp\s+community\b", command.strip()):
@@ -166,7 +155,9 @@ def redact_session_log_file() -> None:
         original = path.read_text(encoding="utf-8", errors="replace")
         # Do not use listing fail-closed here: a session log is not a
         # show snmp community table and must not be replaced wholesale.
-        redacted = redact_secrets(original)
+        # Label-regex still masks Community Name fields (including
+        # communities that are not the configured secret).
+        redacted = redact_community_name_fields(redact_secrets(original))
         if redacted == original:
             return
         path.write_text(redacted, encoding="utf-8")
@@ -252,15 +243,12 @@ def disable_paging_best_effort(conn: Any) -> None:
 
 
 @contextmanager
-def session(
-    *,
-    enable_session_log: bool = True,
-    wide_terminal: bool = False,
-) -> Iterator[Any]:
+def session(*, enable_session_log: bool = True) -> Iterator[Any]:
     """Yield a connected ConnectHandler, exclusive to one caller at a time.
 
     SNMP write tools pass enable_session_log=False so a community echo
     cannot sit in the session log in the clear until disconnect.
+    cisco_s300 session_preparation already sends terminal width 511.
     """
     params = connect_params(enable_session_log=enable_session_log)
     with _LOCK:
@@ -268,8 +256,6 @@ def session(
         try:
             conn = ConnectHandler(**params)
             disable_paging_best_effort(conn)
-            if wide_terminal:
-                _set_terminal_width_best_effort(conn)
             yield conn
         except ValidationError:
             raise
@@ -432,14 +418,27 @@ def send_paged_redacted(conn: Any, command: str) -> str:
     return redact_show_output(command, send_paged(conn, command))
 
 
+_SNMP_SENSITIVE_SHOW_RE = re.compile(
+    r"(?i)^show\s+snmp\s+(community|viewtree|user)\b"
+)
+
+
+def _is_snmp_sensitive_show(command: str) -> bool:
+    return bool(_SNMP_SENSITIVE_SHOW_RE.search(command.strip()))
+
+
 def run_show(command: str) -> str:
-    with session() as conn:
+    # Community / viewtree / user listings can contain secrets; do not
+    # leave them in the netmiko session log until disconnect.
+    enable_session_log = not _is_snmp_sensitive_show(command)
+    with session(enable_session_log=enable_session_log) as conn:
         return send_paged_redacted(conn, command)
 
 
 def run_shows(commands: list[str]) -> dict[str, str]:
     """Run several exec commands in one session; values are already redacted."""
-    with session() as conn:
+    enable_session_log = not any(_is_snmp_sensitive_show(command) for command in commands)
+    with session(enable_session_log=enable_session_log) as conn:
         return {command: send_paged_redacted(conn, command) for command in commands}
 
 
@@ -463,6 +462,15 @@ def _send_config(conn: Any, commands: list[str]) -> str:
         raise ConnectionError(redact_secrets(str(exc))) from None
     text = output if isinstance(output, str) else str(output)
     if config_output_is_error(text, commands=commands):
+        if _commands_include_snmp_community(commands):
+            # Never return or audit device text: wrap, ANSI erase, or a
+            # mid-line prompt redraw can split a community token so span
+            # and exact redaction miss fragments.
+            raise ConnectionError(
+                "Device rejected the configuration sequence. "
+                "The device output is omitted because the sequence may "
+                "include a community string."
+            )
         raise ConnectionError(
             "Device rejected the configuration sequence:\n" + redact_secrets(text)
         )
@@ -497,12 +505,9 @@ def run_config_and_readbacks(
     readbacks: list[str],
     *,
     enable_session_log: bool = True,
-    wide_terminal: bool = False,
 ) -> str:
     """Apply a config set, then run one or more exec read-backs in the same session."""
-    with session(
-        enable_session_log=enable_session_log, wide_terminal=wide_terminal
-    ) as conn:
+    with session(enable_session_log=enable_session_log) as conn:
         _send_config(conn, commands)
         sections: list[str] = ["Configuration sent."]
         for readback in readbacks:
@@ -521,12 +526,9 @@ def run_in_session(
     callback: Any,
     *,
     enable_session_log: bool = True,
-    wide_terminal: bool = False,
 ) -> Any:
     """Run ``callback(conn)`` inside a locked session. Output must be redacted by the caller if needed."""
-    with session(
-        enable_session_log=enable_session_log, wide_terminal=wide_terminal
-    ) as conn:
+    with session(enable_session_log=enable_session_log) as conn:
         return callback(conn)
 
 

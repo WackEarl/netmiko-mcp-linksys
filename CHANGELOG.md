@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (including wrapped lines and `re.escape`/`repr` variants). The community
   charset is `[A-Za-z0-9_]`, length 8–32.
 
+### Changed
+
+- SNMP community rejection paths return only a generic message (no device
+  text). ANSI and prompt redraws are stripped before redaction. Read-back
+  failures after a config send are always reported as "Configuration was
+  sent, verification failed". The `show` tool disables the session log for
+  `show snmp community` / `viewtree` / `user`, and session-log Community
+  Name fields are masked by label. The extra terminal-width helper was
+  removed; `cisco_s300` already sends `terminal width 511` in
+  `session_preparation`.
+
 ## [0.1.3] - 2026-11-13
 
 Fixes from Cody's architecture review and the remaining nits from the

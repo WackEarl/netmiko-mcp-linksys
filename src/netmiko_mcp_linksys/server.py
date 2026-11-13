@@ -588,7 +588,6 @@ def snmp_view_create(view_name: str, subtree: str) -> str:
             commands,
             [READBACK_SNMP_VIEW],
             enable_session_log=False,
-            wide_terminal=True,
         )
         views = parse_snmp_viewtree(output)
         present = any(
@@ -695,11 +694,11 @@ def snmp_community_create(view_name: str, access: str) -> str:
                     + "\n"
                     + _snmp_syntax_note()
                 )
-            except (ValidationError, SwitchConnectionError) as exc:
+            except Exception as exc:  # noqa: BLE001 — must wrap any post-send failure
                 raise _verification_failed(exc) from None
 
         body = run_in_session(
-            _run, enable_session_log=False, wide_terminal=True
+            _run, enable_session_log=False
         )
     except ValidationError as exc:
         return _snmp_fail("snmp_community_create", params, exc, allowed=False)
@@ -768,11 +767,11 @@ def snmp_community_remove(name: str) -> str:
                     + "\n"
                     + _snmp_syntax_note()
                 )
-            except (ValidationError, SwitchConnectionError) as exc:
+            except Exception as exc:  # noqa: BLE001 — must wrap any post-send failure
                 raise _verification_failed(exc) from None
 
         body = run_in_session(
-            _run, enable_session_log=False, wide_terminal=True
+            _run, enable_session_log=False
         )
     except ValidationError as exc:
         return _snmp_fail("snmp_community_remove", params, exc, allowed=False)
@@ -825,11 +824,11 @@ def snmp_user_remove(name: str) -> str:
                     + "\n"
                     + _snmp_syntax_note()
                 )
-            except (ValidationError, SwitchConnectionError) as exc:
+            except Exception as exc:  # noqa: BLE001 — must wrap any post-send failure
                 raise _verification_failed(exc) from None
 
         body = run_in_session(
-            _run, enable_session_log=False, wide_terminal=True
+            _run, enable_session_log=False
         )
     except ValidationError as exc:
         return _snmp_fail("snmp_user_remove", params, exc, allowed=False)

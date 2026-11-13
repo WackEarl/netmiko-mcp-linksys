@@ -247,9 +247,12 @@ in tool output, audit entries, and exceptions, including `re.escape`/`repr`
 forms and a wrapped `snmp community name … security` span. An invalid env
 value is not used for redaction (and is warned at startup). SNMP write
 tools disable the netmiko session log for that session so a community
-echo cannot sit in the log in the clear. `show snmp community` output is
-redacted even when it is run through the `show` tool. Validation
-failures never echo the secret.
+echo cannot sit in the log in the clear. The `show` tool also disables
+the session log for `show snmp community`, `show snmp viewtree`, and
+`show snmp user`. `show snmp community` output is redacted even when it
+is run through the `show` tool; session-log Community Name fields are
+masked by label even when the name is not the configured secret.
+Validation failures never echo the secret.
 
 Suggested order, each call unlock-gated:
 
@@ -303,6 +306,10 @@ firewall, and prefer `ro` if HA only needs to read counters.
   `1.3.6.1.2.1.105` if PoE is needed.
 - Confirm leftover `public` / `private` / `noAuthUser` are gone, and
   that the session log and tool output never contain the community.
+- Terminal width: `cisco_s300` `session_preparation` already sends
+  `terminal width 511`. Confirm that is in effect (no extra width
+  command is sent by these tools) and that `snmp community` lines do
+  not wrap mid-secret in a way that a later live check would miss.
 
 ## Live-test status
 
