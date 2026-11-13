@@ -1389,3 +1389,31 @@ def test_cody_no_terminal_width_helper() -> None:
     assert "wide_terminal" not in inspect.signature(
         connection.run_config_and_readbacks
     ).parameters
+
+
+
+_CODY_PROMPT_LIKE_SAMPLES = (
+    "Port#  Name   Status",
+    "Entry#1 active",
+    "Total>  5",
+    "LGS328PC# show interfaces status",
+)
+
+
+@pytest.mark.parametrize("with_secret", [False, True], ids=["no-env-secret", "with-env-secret"])
+@pytest.mark.parametrize("sample", _CODY_PROMPT_LIKE_SAMPLES)
+def test_cody_redact_secrets_preserves_hash_and_gt_line_starts(
+    monkeypatch: pytest.MonkeyPatch, with_secret: bool, sample: str
+) -> None:
+    """Prompt-like 'Word#' / 'Word>' text must stay byte-identical.
+
+    Normalization runs only when the text contains 'snmp community' and
+    a valid community is configured. These samples contain neither a
+    wrap mid-secret nor that phrase, so they must not change — with or
+    without SWITCH_SNMP_COMMUNITY.
+    """
+    if with_secret:
+        monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", SECRET)
+    else:
+        monkeypatch.delenv("SWITCH_SNMP_COMMUNITY", raising=False)
+    assert redact_secrets(sample) == sample

@@ -95,6 +95,7 @@ def valid_community_for_redaction() -> str | None:
 _PROMPT_REDRAW_RE = re.compile(
     r"(^|[\r\n])[\w.\-]+(?:\([^)\r\n]*\))?[#>]\s*",
 )
+_SNMP_COMMUNITY_HINT_RE = re.compile(r"(?i)snmp\s+community")
 
 
 def prepare_text_for_redaction(text: str) -> str:
@@ -140,16 +141,22 @@ def redact_secrets(text: str) -> str:
     """Strip the switch password and SNMP community from shown or logged text.
 
     The community becomes ``[REDACTED]``; the SSH password stays ``***``
-    (existing behaviour). Community config-line spans are redacted even
-    when the secret is wrapped across line breaks. The env community is
-    only substituted when it is a valid secret (see
-    valid_community_for_redaction). ANSI and prompt redraws are
-    stripped first so a wrap mid-secret can be rejoined.
+    (existing behaviour). The env community is only substituted when it
+    is a valid secret (see valid_community_for_redaction). Without a
+    valid community, this function does not rewrite the text except for
+    an exact password replacement.
+
+    ANSI and prompt redraws are stripped, and wrapped community-command
+    spans are redacted, only when the text contains ``snmp community``
+    (case-insensitive, whitespace-tolerant) *and* a valid community is
+    configured. That path may return a normalized copy. All other
+    output stays byte-identical except for those secret replacements.
     """
-    text = prepare_text_for_redaction(text)
-    text = redact_community_command_spans(text)
     community = valid_community_for_redaction()
     if community:
+        if _SNMP_COMMUNITY_HINT_RE.search(text):
+            text = prepare_text_for_redaction(text)
+            text = redact_community_command_spans(text)
         text = _replace_secret_and_variants(text, community, REDACTED_COMMUNITY)
     password = os.environ.get("SWITCH_PASSWORD") or ""
     if password and password in text:

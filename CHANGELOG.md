@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - SNMP community rejection paths return only a generic message (no device
-  text). ANSI and prompt redraws are stripped before redaction. Read-back
+  text). ANSI and prompt redraws are stripped before redaction only when
+  the text contains `snmp community` and a valid community is configured;
+  other output stays byte-identical except for secret replacements. Read-back
   failures after a config send are always reported as "Configuration was
   sent, verification failed". The `show` tool disables the session log for
   `show snmp community` / `viewtree` / `user`, and session-log Community
