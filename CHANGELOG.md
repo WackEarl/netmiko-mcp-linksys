@@ -21,6 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`description Error LED`); a separate line like
   `Error: port is protected` is
   ([#3](https://github.com/WackEarl/netmiko-mcp-linksys/issues/3)).
+- `port_set_description` now reads back via `show interfaces description`
+  and parses the row for the port (the previous
+  `show interfaces gigabitethernet 0/N` read-back does not show
+  descriptions on the LGS). The informational note reports whether the
+  parsed text matches, is quoted, is empty, is missing, or differs.
+  The table layout is assumed (Cisco/ISS-style fixed-width
+  `Description` column, `Gi0/N` rows); the v0.1.2 live retest confirmed
+  only that the command shows e.g. `Repeater EG` without quotes
+  ([#2](https://github.com/WackEarl/netmiko-mcp-linksys/issues/2)).
+- Blank lines immediately before a page break (as well as after it) are
+  dropped, so the two leftover blank lines seen at page breaks in the
+  v0.1.2 live retest are removed ([#2](https://github.com/WackEarl/netmiko-mcp-linksys/issues/2)).
+- `examples/commands.yml` lists `show interfaces description` (already
+  covered by `show interfaces *`).
 
 ## [0.1.2] - 2026-11-12
 

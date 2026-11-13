@@ -113,7 +113,7 @@ Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 | `port_overview()` | Read-only bundle of `show system information`, `show vlan`, `show power inline`, and `show interfaces`, each passed through the same command filter. | n/a |
 | `port_set_admin_state(port, enabled)` | `interface gigabitethernet 0/N` then `no shutdown` / `shutdown`. | no |
 | `poe_set(port, enabled)` | `interface gigabitethernet 0/N` then `power inline enable` / `power inline disable`. PoE ports: `0/1`–`0/24`. | no |
-| `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back check (found without quotes / found with quotes / not visible). | no |
+| `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back of `show interfaces description` for that port (found without quotes / found with quotes / empty / missing row / unexpected text). | no |
 | `save_config()` | Privileged exec `save` only. Gate this in the hub with `unlock`. | yes |
 
 There are no VLAN, reboot, or reset tools.
@@ -169,9 +169,10 @@ therefore:
    `<--- More --->`, `Press any key to continue`) it sends one space, and it
    finishes on the real prompt (`<hostname>#`). Pager text, backspaces, ANSI
    sequences, orphaned ESC bytes, other control characters, the command echo,
-   and the trailing prompt are stripped. Blank lines directly after a page
-   break (the pager's erase sequence, which netmiko turns into newlines) are
-   dropped; blank lines elsewhere in the output are kept.
+   and the trailing prompt are stripped. Blank lines directly before or after
+   a page break (the pager's erase sequence, which netmiko turns into
+   newlines, and trailing blanks at the end of a page) are dropped; blank
+   lines elsewhere in the output are kept.
 3. Gives up after `SWITCH_READ_TIMEOUT` seconds without new output. The error
    contains the last visible line, so an unknown pager prompt can be added.
 
@@ -204,7 +205,10 @@ Confirmed on LGS328PC, firmware 1.01.02.02 (0.1.0 and 0.1.1 live tests):
 
 Still to confirm with 0.1.2:
 
-- Quoted `description "<text>"` is accepted and shown without quotes.
+- Quoted `description "<text>"` is accepted and shown without quotes in
+  `show interfaces description`. The exact table layout of that command
+  is assumed (Cisco/ISS-style fixed-width `Description` column, `Gi0/N`
+  rows) and should be confirmed live.
 - Page breaks without leftover ESC bytes or blank lines.
 - Whether `set cli pagination off` in config mode is accepted.
 - The other interface tools (`shutdown`, `power inline …`) and the output of

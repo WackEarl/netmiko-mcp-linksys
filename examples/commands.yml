@@ -31,6 +31,7 @@ allowed_commands:
   - show interface *
   - show interfaces
   - show interfaces *
+  - show interfaces description
   - show flow-control
   - show eee
   - show jumbo-frame

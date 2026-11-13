@@ -29,6 +29,7 @@ _LOCK = threading.Lock()
 
 READBACK_INTERFACE = "show interfaces gigabitethernet {port}"
 READBACK_POE = "show power inline gigabitethernet {port}"
+READBACK_DESCRIPTION = "show interfaces description"
 
 DEFAULT_READ_TIMEOUT = 60.0
 MAX_READ_TIMEOUT = 600.0
@@ -241,8 +242,9 @@ def clean_output(raw: str, command: str, prompt_re: re.Pattern[str]) -> str:
     """Strip ANSI, control characters, pager prompts and their erase leftovers,
     the command echo, and the prompt.
 
-    Blank lines directly after a page break are dropped; blank lines elsewhere
-    in the device output are kept.
+    Blank lines directly before or after a page break are dropped
+    (pager erase leftovers, including trailing blanks at the end of a
+    page); blank lines elsewhere in the device output are kept.
     """
     text = _strip_controls(raw)
     text = PAGER_RE.sub("", text)
@@ -253,6 +255,8 @@ def clean_output(raw: str, command: str, prompt_re: re.Pattern[str]) -> str:
         if PAGE_BREAK in line:
             line = line.replace(PAGE_BREAK, "")
             after_break = True
+            while lines and not lines[-1].strip():
+                lines.pop()
         if "\r" in line:
             segments = [seg for seg in line.split("\r") if seg.strip()]
             line = segments[-1] if segments else ""

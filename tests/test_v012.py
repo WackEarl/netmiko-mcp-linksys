@@ -1,4 +1,4 @@
-"""0.1.2: quoted descriptions and page-break cleanup (issue #1)."""
+"""Quoted descriptions, description read-back, and page-break cleanup (#1, #2)."""
 
 from __future__ import annotations
 
@@ -7,14 +7,40 @@ from unittest.mock import patch
 import pytest
 
 from netmiko_mcp_linksys.connection import (
+    PAGE_BREAK,
+    READBACK_DESCRIPTION,
     build_description_commands,
     clean_output,
     send_paged,
 )
-from netmiko_mcp_linksys.server import description_readback_note, port_set_description
+from netmiko_mcp_linksys.server import (
+    description_readback_note,
+    parse_interface_description,
+    port_set_description,
+)
 from tests.test_pager_audit import FakeChannel
 
-READBACK_HEAD = "Gi0/24 up, line protocol is up (connected)"
+
+# Assumed Cisco/ISS-style show interfaces description table. The v0.1.2 live
+# retest confirmed that this command shows e.g. "Repeater EG" without quotes,
+# but no full table was captured. Rows are fixed-width; Description starts
+# at the same column as the header word. Confirm on the next live test.
+def _desc_row(port: str, status: str, proto: str, desc: str) -> str:
+    return f"Gi{port}".ljust(31) + status.ljust(15) + proto.ljust(9) + desc
+
+
+ASSUMED_DESCRIPTION_HEADER = (
+    "Interface".ljust(31) + "Status".ljust(15) + "Protocol".ljust(9) + "Description"
+)
+ASSUMED_INTERFACES_DESCRIPTION = "\n".join(
+    [
+        ASSUMED_DESCRIPTION_HEADER,
+        _desc_row("0/1", "up", "up", ""),
+        _desc_row("0/7", "up", "up", "Repeater EG"),
+        _desc_row("0/17", "down", "down", "Invalid Port"),
+        _desc_row("0/24", "up", "up", "nas uplink"),
+    ]
+)
 
 
 def test_description_with_space_is_quoted() -> None:
@@ -40,30 +66,53 @@ def test_quotes_in_input_still_rejected(text: str) -> None:
     assert result.startswith("Rejected:")
 
 
-def test_port_set_description_sends_quoted_and_checks_readback() -> None:
+def test_port_set_description_reads_back_interfaces_description() -> None:
     readback = (
-        "Configuration sent.\n--- show interfaces gigabitethernet 0/7 ---\n"
-        f"{READBACK_HEAD}\nDescription: Repeater EG\n"
+        "Configuration sent.\n--- show interfaces description ---\n"
+        + ASSUMED_INTERFACES_DESCRIPTION
+        + "\n"
     )
     with patch(
         "netmiko_mcp_linksys.server.run_config_and_readback", return_value=readback
     ) as run:
         result = port_set_description("0/7", "Repeater EG")
-    commands, _ = run.call_args.args
+    commands, command = run.call_args.args
     assert commands[1] == 'description "Repeater EG"'
+    assert command == READBACK_DESCRIPTION == "show interfaces description"
     assert result.startswith("Configuration sent.")
     assert "description found in read-back (without quotes)" in result
 
 
+def test_parse_interface_description_from_assumed_table() -> None:
+    table = ASSUMED_INTERFACES_DESCRIPTION
+    assert parse_interface_description(table, "0/7") == "Repeater EG"
+    assert parse_interface_description(table, "0/1") == ""
+    assert parse_interface_description(table, "0/17") == "Invalid Port"
+    assert parse_interface_description(table, "0/2") is None
+    # Gi0/1 must not match the Gi0/17 row.
+    assert parse_interface_description(table, "0/1") != "Invalid Port"
+
+
+def test_parse_interface_description_ignores_other_ports_and_header() -> None:
+    wrapped = (
+        "Configuration sent.\n--- show interfaces description ---\n"
+        + ASSUMED_INTERFACES_DESCRIPTION
+    )
+    assert parse_interface_description(wrapped, "0/7") == "Repeater EG"
+    # A substring on another port is not this port's description.
+    assert parse_interface_description(wrapped, "0/24") == "nas uplink"
+
+
 def test_readback_note_variants() -> None:
-    assert "WITH quotes" in description_readback_note('Description: "Repeater EG"', "Repeater EG")
-    assert "without quotes" in description_readback_note("Description: Repeater EG", "Repeater EG")
-    assert "not visible" in description_readback_note(READBACK_HEAD, "Repeater EG")
-    # header line is ignored
-    header = "Configuration sent.\n--- show interfaces gigabitethernet 0/7 ---\n" + READBACK_HEAD
-    assert "not visible" in description_readback_note(header, "interfaces")
-    # no substring false positives
-    assert "not visible" in description_readback_note("Description: Repeater EG2", "Repeater EG")
+    table = ASSUMED_INTERFACES_DESCRIPTION
+    assert "without quotes" in description_readback_note(table, "0/7", "Repeater EG")
+    quoted = table.replace("Repeater EG", '"Repeater EG"')
+    assert "WITH quotes" in description_readback_note(quoted, "0/7", "Repeater EG")
+    assert "no row for 0/2" in description_readback_note(table, "0/2", "Repeater EG")
+    assert "expected" in description_readback_note(table, "0/7", "nas uplink")
+    assert "is empty" in description_readback_note(table, "0/1", "Repeater EG")
+    assert "description is empty." in description_readback_note(table, "0/1", None)
+    assert "still" in description_readback_note(table, "0/7", None)
 
 
 def _rows(start: int, stop: int) -> str:
@@ -151,3 +200,27 @@ def test_whitespace_only_description_rejected():
     from netmiko_mcp_linksys.validation import ValidationError, validate_description
     with _pytest.raises(ValidationError):
         validate_description("   ")
+
+
+def test_blank_lines_immediately_before_page_break_are_removed() -> None:
+    # Live leftover of #2: two blank lines at the end of a page, before --More--.
+    chan = FakeChannel(
+        [
+            ["show interfaces status\n", _rows(1, 21), "\n\n", "--More--"],
+            [_rows(21, 29), "\nLGS328PC#"],
+        ]
+    )
+    out = send_paged(chan, "show interfaces status", timeout=2, poll_interval=0)
+    lines = out.splitlines()
+    assert len(lines) == 28, lines
+    assert lines[19].startswith("Gi0/20 ")
+    assert lines[20].startswith("Gi0/21 ")
+    assert "\n\n" not in out
+
+
+def test_clean_output_drops_blanks_on_both_sides_of_page_break() -> None:
+    import re
+
+    prompt = re.compile(r"^\s*LGS328PC[^\r\n#>]*[#>]\s*$")
+    raw = "show x\nGi0/20\n\n\n" + PAGE_BREAK + "\n\nGi0/21\n\nLGS328PC#"
+    assert clean_output(raw, "show x", prompt) == "Gi0/20\nGi0/21"

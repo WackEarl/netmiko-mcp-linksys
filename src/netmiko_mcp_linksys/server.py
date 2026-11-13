@@ -18,6 +18,7 @@ from netmiko_mcp.security import (
 
 from netmiko_mcp_linksys.audit import check_audit_path, write_audit
 from netmiko_mcp_linksys.connection import (
+    READBACK_DESCRIPTION,
     READBACK_INTERFACE,
     READBACK_POE,
     build_admin_state_commands,
@@ -222,26 +223,89 @@ def poe_set(port: str, enabled: bool) -> str:
     return _ok("poe_set", params, output)
 
 
-def description_readback_note(readback: str, text: str) -> str:
-    """Compare the read-back with the requested description (informational).
+def _port_token_end(line: str, port: str) -> int | None:
+    """If line starts with a Gi0/N-style name for port, return the end index."""
+    stripped = line.lstrip()
+    pad = len(line) - len(stripped)
+    lower = stripped.lower()
+    for token in (
+        f"gi{port}",
+        f"gi {port}",
+        f"gigabitethernet{port}",
+        f"gigabitethernet {port}",
+    ):
+        if lower.startswith(token) and (
+            len(stripped) == len(token) or not stripped[len(token)].isalnum()
+        ):
+            return pad + len(token)
+    return None
+
+
+def _is_interface_row(line: str) -> bool:
+    return bool(re.match(r"(?i)^\s*(?:gi|gigabitethernet)\s*0/\d+", line))
+
+
+def parse_interface_description(output: str, port: str) -> str | None:
+    """Return the description for port (e.g. '0/7') from a description table.
+
+    ``None`` means no row for that port was found; an empty string means the
+    row was present with no description.
+
+    The exact LGS328PC table layout has not been captured in a fixture. The
+    live retest of v0.1.2 only confirmed that ``show interfaces description``
+    shows the text (e.g. ``Repeater EG``, without quotes). This parser
+    assumes a Cisco/ISS-style fixed-width table with a header that contains
+    ``Description`` (or ``Name``) and data rows starting with ``Gi0/N``.
+    The description is the slice of the row starting at the header column.
+    Confirm the layout on the next live test.
+    """
+    body = output.split(" ---\n", 1)[-1]
+    header_col: int | None = None
+    for line in body.splitlines():
+        raw = line.rstrip()
+        if not raw.strip():
+            continue
+        if header_col is None and not _is_interface_row(raw):
+            match = re.search(r"\bDescription\b", raw, re.IGNORECASE) or re.search(
+                r"\bName\b", raw, re.IGNORECASE
+            )
+            if match:
+                header_col = match.start()
+                continue
+        end = _port_token_end(raw, port)
+        if end is None:
+            continue
+        if header_col is not None:
+            return raw[header_col:].strip() if len(raw) > header_col else ""
+        return raw[end:].strip()
+    return None
+
+
+def description_readback_note(readback: str, port: str, text: str | None) -> str:
+    """Compare the parsed description for port with the requested text.
 
     The command is sent quoted; the switch should store and show the text
     without quotes. A quoted match means the quotes were stored literally.
     """
-    # Only look at the device output, not the "--- <command> ---" header.
-    readback = readback.split(" ---\n", 1)[-1]
-    bounded = r"(?<![A-Za-z0-9._-]){}(?![A-Za-z0-9._-])"
-    if re.search(bounded.format(re.escape(f'"{text}"')), readback):
+    parsed = parse_interface_description(readback, port)
+    if parsed is None:
+        return (
+            f"Read-back check: no row for {port} in show interfaces description."
+        )
+    if text is None:
+        if not parsed:
+            return "Read-back check: description is empty."
+        return f"Read-back check: description is still {parsed!r}."
+    if parsed == f'"{text}"':
         return (
             "Read-back check: description appears WITH quotes; the switch "
             "stored the quotes literally."
         )
-    if re.search(bounded.format(re.escape(text)), readback):
+    if parsed == text:
         return "Read-back check: description found in read-back (without quotes)."
-    return (
-        "Read-back check: description not visible in the read-back output; "
-        "this show command may not display descriptions."
-    )
+    if not parsed:
+        return "Read-back check: description is empty in the read-back output."
+    return f"Read-back check: description is {parsed!r}, expected {text!r}."
 
 
 @mcp.tool()
@@ -253,9 +317,8 @@ def port_set_description(port: str, text: str | None = None) -> str:
         if text is not None:
             validate_description(text)
         commands = build_description_commands(port, text)
-        output = run_config_and_readback(commands, READBACK_INTERFACE.format(port=port))
-        if text is not None:
-            output = f"{output}\n\n{description_readback_note(output, text)}"
+        output = run_config_and_readback(commands, READBACK_DESCRIPTION)
+        output = f"{output}\n\n{description_readback_note(output, port, text)}"
     except ValidationError as exc:
         return _fail("port_set_description", params, f"Rejected: {exc}", allowed=False)
     except SwitchConnectionError as exc:

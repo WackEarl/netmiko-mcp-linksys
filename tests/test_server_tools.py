@@ -59,9 +59,11 @@ def test_description_none_clears() -> None:
         "netmiko_mcp_linksys.server.run_config_and_readback", return_value="cleared"
     ) as run:
         result = port_set_description("0/1", None)
-    assert result == "cleared"
-    commands, _ = run.call_args.args
+    assert result.startswith("cleared")
+    assert "no row for 0/1 in show interfaces description" in result
+    commands, readback = run.call_args.args
     assert commands == ["interface gigabitethernet 0/1", "no description"]
+    assert readback == "show interfaces description"
 
 
 def test_save_config_tool() -> None:

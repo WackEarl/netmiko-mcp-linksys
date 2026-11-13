@@ -74,6 +74,7 @@ def test_invalid_descriptions(text: str) -> None:
         "show power inline gigabitethernet 0/1",
         "show interfaces",
         "show interfaces gigabitethernet 0/1",
+        "show interfaces description",
     ],
 )
 def test_show_allow_list(command: str, reset_command_file: None, monkeypatch: pytest.MonkeyPatch) -> None:
