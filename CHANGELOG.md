@@ -72,6 +72,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `no snmp view <view> <oid>` and the viewtree must equal the state
   before, else the result says `ROLLBACK NOT VERIFIED`. Before, one
   batch sent the include even if an exclusion was refused.
+- The write-view rollback is staged (Cody, retest of d4014b4). The
+  included column of this call is removed first and verified; if it is
+  still there or the read-back is unclear, the rollback stops, keeps all
+  exclusions and reports `ROLLBACK NOT VERIFIED` (bound communities may
+  be affected). Only then this call's exclusions are removed, and never
+  one that still protects an included column. Before, one batch removed
+  the column and the exclusions, so a refused column removal left
+  `pethPsePortAdminEnable` writable without its PoE exclusions.
+- `oid_arcs` accepts a leading `iso` only as `iso.3…`; `iso.1.3.6…`, a
+  bare `iso` and other variants are refused (fail-closed) instead of
+  being read as `1.1.3.6…`.
 - One central OID normalization (`oid_arcs`/`canonical_oid`/`oid_within`)
   for all view checks, prechecks and read-backs: leading dot, `iso`,
   trailing dots and whitespace are accepted, prefixes are compared by

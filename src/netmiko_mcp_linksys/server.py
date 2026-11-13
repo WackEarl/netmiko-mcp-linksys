@@ -779,36 +779,100 @@ def _read_views(conn: Any) -> tuple[str, list[ViewSubtree]]:
 
 
 def _rollback_write_view(
-    conn: Any, view_name: str, oids: list[str], before: list[ViewSubtree]
+    conn: Any,
+    view_name: str,
+    include_oid: str | None,
+    exclusions: list[str],
+    before: list[ViewSubtree],
 ) -> str:
-    """Remove ``oids`` added by this call, then verify the viewtree equals ``before``.
+    """Undo what this call added, include first, then verify against ``before``.
 
-    Linksys CLI: ``no snmp view <ViewName> <OIDTree>``. All removals are
-    sent (no error_pattern) so one refused line does not skip the rest;
-    the result is judged only by the read-back.
+    Linksys CLI: ``no snmp view <ViewName> <OIDTree>``. Rule: an exclusion
+    is never removed while an included subtree it protects is still in
+    the view (Cody, retest of d4014b4).
+
+    1. If this call added ``include_oid``, remove only that and read the
+       viewtree back. If it is still there, or the read-back is unclear,
+       stop at once and keep every exclusion.
+    2. Only then remove this call's exclusions, except any that still
+       protect an included subtree of the view, and compare the viewtree
+       with ``before``.
     """
-    removed = ", ".join(oids) if oids else "nothing"
     send_note = ""
-    if oids:
+
+    def _send_removals(oids: list[str], **kwargs: Any) -> None:
+        nonlocal send_note
         try:
-            _send_config(conn, [f"no snmp view {view_name} {oid}" for oid in oids])
-        except Exception:  # noqa: BLE001 — judged by the read-back below
+            _send_config(
+                conn, [f"no snmp view {view_name} {oid}" for oid in oids], **kwargs
+            )
+        except Exception:  # noqa: BLE001 — judged by the read-back
             send_note = " The switch reported an error for at least one removal."
+
+    def _current() -> list[ViewSubtree] | None:
+        try:
+            _, views = _read_views(conn)
+        except Exception:  # noqa: BLE001 — an unreadable state is "unclear"
+            return None
+        if not views or view_entry_problem(views, view_name):
+            return None
+        return views
+
+    def _include_left(views: list[ViewSubtree]) -> bool:
+        return include_oid in set(view_included_oids(views, view_name))
+
+    if include_oid is not None:
+        _send_removals([include_oid], error_pattern=CONFIG_ERROR_PATTERN)
+        now = _current()
+        if now is None or _include_left(now):
+            state = "unclear (read-back failed)" if now is None else "still present"
+            return (
+                f"ROLLBACK NOT VERIFIED: the included column {include_oid} is "
+                f"{state} in view {view_name}; the exclusions were kept "
+                "(an exclusion is never removed while its column may be "
+                f"included). Check show snmp viewtree for {view_name} now, and "
+                "check show snmp group access: communities already bound to "
+                f"this view may be affected. Do not bind a community to {view_name} "
+                "until it is fixed." + send_note
+            )
+    else:
+        now = _current()
+    if now is None:
+        return (
+            f"ROLLBACK NOT VERIFIED: show snmp viewtree could not be read "
+            f"cleanly, so the exclusions of view {view_name} were kept. Check "
+            "the view and its community bindings on the switch before using "
+            "it; do not bind a community to it." + send_note
+        )
+    included = view_included_oids(now, view_name)
+    kept = [
+        oid for oid in exclusions if any(oid_within(oid, column) for column in included)
+    ]
+    removable = [oid for oid in exclusions if oid not in kept]
+    if removable:
+        _send_removals(removable)
     try:
-        _, now = _read_views(conn)
-        restored = bool(now) and view_entry_set(now) == view_entry_set(before)
+        _, after = _read_views(conn)
+        restored = bool(after) and view_entry_set(after) == view_entry_set(before)
     except Exception:  # noqa: BLE001 — an unreadable state is "not verified"
         restored = False
+    undone = ", ".join(([include_oid] if include_oid else []) + removable) or "nothing"
     if restored:
         return (
-            f"Rolled back (removed {removed}); show snmp viewtree matches "
+            f"Rolled back (removed {undone}); show snmp viewtree matches "
             "the state before this call." + send_note
         )
+    kept_note = (
+        f" Kept exclusion(s) {', '.join(kept)} because they protect a column "
+        "that is still included."
+        if kept
+        else ""
+    )
     return (
-        f"ROLLBACK NOT VERIFIED (tried to remove {removed}): show snmp "
-        "viewtree does not match the state before this call. Check the "
-        f"view {view_name} on the switch before using it; do not bind a "
-        "community to it." + send_note
+        f"ROLLBACK NOT VERIFIED (tried to remove {undone}): show snmp "
+        "viewtree does not match the state before this call." + kept_note
+        + f" Check the view {view_name} on the switch before using it; do not "
+        "bind a community to it." + send_note
     )
 
 
@@ -858,7 +922,7 @@ def _apply_write_view(
                     "exclusion(s) missing in show snmp viewtree: " + ", ".join(missing)
                 )
         except Exception as exc:  # noqa: BLE001 — every failure must roll back
-            rollback = _rollback_write_view(conn, view_name, new_exclusions, before)
+            rollback = _rollback_write_view(conn, view_name, None, new_exclusions, before)
             raise SwitchConnectionError(
                 "Exclusions were not applied, the included column "
                 f"{oid} was NOT sent: {redact_secrets(str(exc))}. {rollback}"
@@ -877,8 +941,9 @@ def _apply_write_view(
         if oid not in set(view_included_oids(after, view_name)):
             raise ValidationError(f"write view {view_name!r} does not include {oid}")
     except Exception as exc:  # noqa: BLE001 — every failure must roll back
-        undo = ([oid] if include_new else []) + new_exclusions
-        rollback = _rollback_write_view(conn, view_name, undo, before)
+        rollback = _rollback_write_view(
+            conn, view_name, oid if include_new else None, new_exclusions, before
+        )
         raise SwitchConnectionError(
             "Configuration was sent, verification failed: "
             f"{redact_secrets(str(exc))}. {rollback}"
