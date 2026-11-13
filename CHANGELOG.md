@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   allow-listed subtree for PoE. Command templates live in `snmp_cli.py`
   and follow the Linksys LGSXXX CLI manual; they are **not live-confirmed**
   ([#7](https://github.com/WackEarl/netmiko-mcp-linksys/issues/7)).
+  SNMP write tools require `SWITCH_SNMP_WRITE_ENABLED=1` (off by default),
+  disable the session log for the call, and redact community echoes
+  (including wrapped lines and `re.escape`/`repr` variants). The community
+  charset is `[A-Za-z0-9_]`, length 8–32.
 
 ## [0.1.3] - 2026-11-13
 

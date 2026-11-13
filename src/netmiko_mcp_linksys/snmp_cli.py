@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from netmiko_mcp_linksys.validation import (
     ValidationError,
     redact_secrets,
+    valid_community_for_redaction,
 )
 
 # ---------------------------------------------------------------------------
@@ -294,7 +295,7 @@ def parse_snmp_community(output: str) -> list[CommunityEntry]:
         entries.append(
             CommunityEntry(
                 index=index,
-                name=name or index,
+                name=name,
                 security_name=security,
                 raw=record,
             )
@@ -373,30 +374,44 @@ def parse_snmp_user(output: str) -> list[UserEntry]:
     return entries
 
 
+UNPARSEABLE_COMMUNITY_LISTING = (
+    "[REDACTED: unparseable show snmp community output]"
+)
+
+_COMMUNITY_INDEX_LABEL_RE = re.compile(
+    r"(?im)^(\s*(?:Community\s*Index|CommunityIndex)\s*:\s*)(\S.*)$"
+)
+
+
 def redact_community_listing(text: str, *, names: list[str] | None = None) -> str:
     """Redact community strings in show snmp community (and similar) text.
 
-    Always replaces SWITCH_SNMP_COMMUNITY / SWITCH_PASSWORD via
-    redact_secrets, then values after a Community Name label, then any
-    explicit names (parsed entries or public/private).
+    If the ISS key: value parser yields no entries, the whole listing
+    body is replaced (fail closed: an unknown layout must not show
+    foreign communities in the clear). Otherwise only Community Name
+    fields (and a Community Index field that equals the configured
+    secret) are redacted; values are never globally replaced.
     """
-    to_hide = [item for item in (names or []) if item and item != REDACTED]
-    # Parse before replacing names so we still see the original values.
+    del names  # no longer used for global replacement
     parsed = parse_snmp_community(text)
-    to_hide.extend(entry.name for entry in parsed if entry.name)
-    to_hide.extend(
-        entry.index for entry in parsed if entry.index and entry.index == entry.name
-    )
+    if not parsed:
+        match = re.search(r"^--- .+ ---\n", text, re.MULTILINE)
+        prefix = text[: match.end()] if match else ""
+        return prefix + UNPARSEABLE_COMMUNITY_LISTING
     redacted = redact_secrets(text)
-    redacted = _COMMUNITY_NAME_LABEL_RE.sub(lambda match: match.group(1) + REDACTED, redacted)
-    # Longest first so a prefix of another name is not left behind badly.
-    seen: set[str] = set()
-    for name in sorted(to_hide, key=len, reverse=True):
-        if name in seen or not name:
-            continue
-        seen.add(name)
-        if name in redacted:
-            redacted = redacted.replace(name, REDACTED)
+    redacted = _COMMUNITY_NAME_LABEL_RE.sub(
+        lambda match: match.group(1) + REDACTED, redacted
+    )
+    # Per-field only: mask an index that is itself the configured secret.
+    community = valid_community_for_redaction()
+    if community:
+        def _redact_index(match: re.Match[str]) -> str:
+            value = match.group(2)
+            if value == community or value.lower() == community.lower():
+                return match.group(1) + REDACTED
+            return match.group(0)
+
+        redacted = _COMMUNITY_INDEX_LABEL_RE.sub(_redact_index, redacted)
     return redacted
 
 
@@ -436,7 +451,11 @@ def view_is_restricted(entries: list[ViewSubtree], view_name: str) -> tuple[bool
 
 def _model_is_v2c(model: str) -> bool:
     compact = re.sub(r"[\s._-]", "", model.lower())
-    return compact in {"", "v2c", "snmpv2c", "snmpv2", "v2"}
+    return compact in {"v2c", "snmpv2c", "snmpv2", "v2"}
+
+
+def _model_is_missing(model: str) -> bool:
+    return not model.strip()
 
 
 def _view_is_none(name: str) -> bool:
@@ -448,8 +467,6 @@ def find_community_entry(
 ) -> CommunityEntry | None:
     for entry in entries:
         if entry.name == community or entry.index == community:
-            return entry
-        if entry.name.lower() == community.lower():
             return entry
     return None
 
@@ -494,9 +511,11 @@ def assert_configured_community_ready(
         if item.user.lower() == security.lower() and _model_is_v2c(item.model)
     ]
     if not matched_groups and groups:
-        # Some ISS output omits the model; accept a unique user match.
+        # Fallback only when the model field is empty, never for v1/v3.
         matched_groups = [
-            item for item in groups if item.user.lower() == security.lower()
+            item
+            for item in groups
+            if item.user.lower() == security.lower() and _model_is_missing(item.model)
         ]
     if not matched_groups:
         raise ValidationError(
@@ -512,7 +531,11 @@ def assert_configured_community_ready(
         if item.group in group_names and _model_is_v2c(item.model)
     ]
     if not matched_access and accesses:
-        matched_access = [item for item in accesses if item.group in group_names]
+        matched_access = [
+            item
+            for item in accesses
+            if item.group in group_names and _model_is_missing(item.model)
+        ]
     if not matched_access:
         raise ValidationError(
             "Configured community's group has no v2c access entry "
@@ -533,15 +556,22 @@ def assert_configured_community_ready(
                 note + ". Refusing to remove another community."
             )
         notes.append("read " + note)
-        if not _view_is_none(item.write_view):
+        write = item.write_view.strip()
+        if write.lower() == "none":
+            notes.append("write view is none (read-only access)")
+        elif not write:
+            raise ValidationError(
+                "Configured community's access has no write view "
+                "(missing or unrecognised label). Refusing to remove "
+                "another community."
+            )
+        else:
             ok, note = view_is_restricted(views, item.write_view)
             if not ok:
                 raise ValidationError(
                     "write " + note + ". Refusing to remove another community."
                 )
             notes.append("write " + note)
-        else:
-            notes.append("write view is none (read-only access)")
     return (
         "Configured community is present, bound to group(s) "
         + ", ".join(sorted(group_names))

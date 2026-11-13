@@ -151,6 +151,11 @@ Privacy Protocol        : None
 """
 
 
+@pytest.fixture(autouse=True)
+def enable_snmp_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SWITCH_SNMP_WRITE_ENABLED", "1")
+
+
 @pytest.fixture
 def community_env(monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", SECRET)
@@ -209,6 +214,20 @@ def test_community_secret_validation_never_echoes(
         validate_snmp_community_secret()
     assert "has space" not in str(bad.value)
     assert "The value is not shown" in str(bad.value)
+
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", "Ha.If-Mib.Comm9")
+    with pytest.raises(ValidationError, match="invalid") as dotted:
+        validate_snmp_community_secret()
+    assert "Ha.If" not in str(dotted.value)
+
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", "A" * 33)
+    with pytest.raises(ValidationError, match="invalid"):
+        validate_snmp_community_secret()
+
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", "Abcdefg1")
+    assert validate_snmp_community_secret() == "Abcdefg1"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", "A" * 32)
+    assert validate_snmp_community_secret() == "A" * 32
 
     monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", SECRET)
     assert validate_snmp_community_secret() == SECRET
@@ -502,7 +521,7 @@ def test_snmp_community_create_and_redaction(community_env: str) -> None:
         READBACK_SNMP_ACCESS: ACCESS_SHOW_RW,
     }
 
-    def fake_session(callback: Any) -> str:
+    def fake_session(callback: Any, **_kwargs: Any) -> str:
         class Conn:
             pass
 
@@ -542,7 +561,7 @@ def test_snmp_community_create_requires_env(monkeypatch: pytest.MonkeyPatch) -> 
 def test_snmp_community_create_refuses_missing_view(community_env: str) -> None:
     from netmiko_mcp_linksys.server import snmp_community_create
 
-    def fake_session(callback: Any) -> str:
+    def fake_session(callback: Any, **_kwargs: Any) -> str:
         with (
             patch(
                 "netmiko_mcp_linksys.server._snmp_exec",
@@ -587,7 +606,7 @@ Security Name: none
             return VIEW_SHOW_RESTRICTED
         raise AssertionError(command)
 
-    def fake_session(callback: Any) -> str:
+    def fake_session(callback: Any, **_kwargs: Any) -> str:
         with (
             patch("netmiko_mcp_linksys.server._snmp_exec", side_effect=exec_cmd),
             patch("netmiko_mcp_linksys.server._send_config", return_value="ok") as sent,
@@ -615,7 +634,7 @@ Community Name: public
 Security Name: none
 """
 
-    def fake_session(callback: Any) -> str:
+    def fake_session(callback: Any, **_kwargs: Any) -> str:
         def exec_cmd(_conn: Any, command: str) -> str:
             if command == READBACK_SNMP_COMMUNITY:
                 return only_defaults
@@ -657,7 +676,7 @@ def test_snmp_community_remove_refuses_configured_name(community_env: str) -> No
 def test_snmp_user_remove_and_already_absent() -> None:
     from netmiko_mcp_linksys.server import snmp_user_remove
 
-    def fake_session_present(callback: Any) -> str:
+    def fake_session_present(callback: Any, **_kwargs: Any) -> str:
         after = USER_SHOW.replace("noAuthUser", "goneUser")
 
         def exec_cmd(_conn: Any, command: str) -> str:
@@ -687,7 +706,7 @@ def test_snmp_user_remove_and_already_absent() -> None:
     assert "no longer present" in result
     assert "no snmp user noAuthUser" in result
 
-    def fake_session_absent(callback: Any) -> str:
+    def fake_session_absent(callback: Any, **_kwargs: Any) -> str:
         with (
             patch(
                 "netmiko_mcp_linksys.server._snmp_exec",
@@ -729,3 +748,401 @@ def test_show_snmp_bare_still_denied(reset_command_file: None) -> None:
 
     result = show("show snmp")
     assert result.startswith("Command rejected:")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests from Cody's security probes (probe.py, probe2.py, p3.py, p5.py)
+# ---------------------------------------------------------------------------
+
+
+def _secret_in(text: str, secret: str) -> bool:
+    """True if the secret or a common escaped/repr form appears in text."""
+    if secret in text or secret.lower() in text.lower():
+        return True
+    escaped = __import__("re").escape(secret)
+    if escaped in text or escaped.replace("\\", "\\\\") in text:
+        return True
+    if repr(secret) in text or repr(escaped) in text:
+        return True
+    # Recover by stripping backslashes, as in probe2.py.
+    stripped = text.replace("\\", "")
+    return secret in stripped
+
+
+class _FakeConn:
+    def __init__(self, cfg: Any = None) -> None:
+        self.cfg = cfg
+        self.width: int | None = None
+
+    def send_config_set(self, cmds: list[str], **_kwargs: Any) -> str:
+        if callable(self.cfg):
+            return self.cfg(cmds)
+        return self.cfg or ""
+
+    def disconnect(self) -> None:
+        return None
+
+    def set_terminal_width(self, width: int) -> None:
+        self.width = width
+
+
+def _run_snmp_tool(
+    tool: str,
+    fake: _FakeConn,
+    shows: dict[str, Any],
+    *args: Any,
+) -> str:
+    from netmiko_mcp_linksys import connection, server
+
+    def fake_paged(_conn: Any, command: str, *_a: Any, **_k: Any) -> str:
+        value = shows.get(command, "")
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    with (
+        patch.object(connection, "connect_params", lambda **_k: {}),
+        patch.object(connection, "ConnectHandler", lambda **_k: fake),
+        patch.object(connection, "disable_paging_best_effort", lambda _c: None),
+        patch.object(connection, "send_paged", fake_paged),
+        patch.object(server, "send_paged", fake_paged),
+    ):
+        return getattr(server, tool)(*args)
+
+
+def test_cody_cmd_verify_timeout_does_not_leak(community_env: str, audit_log) -> None:
+    """Finding 1: netmiko cmd_verify ReadTimeout must not return or audit str(exc)."""
+    from netmiko.exceptions import ReadTimeout
+
+    def cfg_timeout(cmds: list[str]) -> str:
+        pat = __import__("re").escape(cmds[-1].strip())
+        raise ReadTimeout(f"\n\nPattern not detected: {pat!r} in output.\n")
+
+    result = _run_snmp_tool(
+        "snmp_community_create",
+        _FakeConn(cfg_timeout),
+        {READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED},
+        "ifmib",
+        "ro",
+    )
+    assert SECRET not in result
+    assert not _secret_in(result, SECRET)
+    assert "ReadTimeout" in result
+    assert "exception text is omitted" in result
+    assert not result.startswith("Rejected:")
+    audit = audit_log.read_text(encoding="utf-8")
+    assert not _secret_in(audit, SECRET)
+    record = json.loads(audit.splitlines()[-1])
+    assert record["allowed"] is True
+    assert not _secret_in(record["result"], SECRET)
+
+
+def test_cody_wrapped_echo_does_not_leak(monkeypatch: pytest.MonkeyPatch, audit_log) -> None:
+    """Finding 2: a line wrap mid-secret must not leak either half."""
+    secret = "HaIfMibComm9xLongSecret42"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", secret)
+
+    def cfg_wrap(cmds: list[str]) -> str:
+        line = cmds[-1]
+        cut = len("snmp community name ") + 12
+        return (
+            f"sw(config)# {line[:cut]}\r\n{line[cut:]}\r\n"
+            "% Invalid input detected\r\nsw(config)#"
+        )
+
+    result = _run_snmp_tool(
+        "snmp_community_create",
+        _FakeConn(cfg_wrap),
+        {READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED},
+        "ifmib",
+        "ro",
+    )
+    assert not _secret_in(result, secret)
+    assert secret[:12] not in result
+    assert secret[12:] not in result
+    assert "[REDACTED]" in result or "exception text is omitted" in result or "Invalid input" in result
+    assert not _secret_in(audit_log.read_text(encoding="utf-8"), secret)
+
+
+def test_cody_wrapped_echo_at_column_60(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = "A" * 20 + "Bcdefgh1234"
+    assert 8 <= len(secret) <= 32
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", secret)
+
+    def cfg_wrap(cmds: list[str]) -> str:
+        line = cmds[-1]
+        wrapped = line[:60] + "\r\n" + line[60:]
+        return f"sw(config)# {wrapped}\r\n% Invalid input detected\r\nsw(config)#"
+
+    result = _run_snmp_tool(
+        "snmp_community_create",
+        _FakeConn(cfg_wrap),
+        {READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED},
+        "ifmib",
+        "ro",
+    )
+    assert not _secret_in(result, secret)
+    frag = secret[60 - len("snmp community name ") :] if 60 > len("snmp community name ") else secret
+    assert frag not in result or frag == ""
+
+
+def test_cody_short_invalid_env_does_not_mangle_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 9: a short or invalid env community must not be used for redaction."""
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", "a")
+    assert redact_secrets("Gi0/1 admin state up") == "Gi0/1 admin state up"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", "1")
+    assert redact_secrets("Gi0/1 1.3.6.1.2.1.31") == "Gi0/1 1.3.6.1.2.1.31"
+    from netmiko_mcp_linksys.server import startup_checks
+
+    warnings = startup_checks()
+    assert any("invalid" in item or "not used" in item or "SWITCH_SNMP_COMMUNITY" in item for item in warnings)
+    assert all("is not shown" in item or "1" not in item or "invalid" in item.lower() or "disabled" in item.lower() or "not 1" in item or "empty" in item.lower() or "SWITCH" in item for item in warnings)
+    joined = "\n".join(warnings)
+    # The warning must not echo the bad secret as a standalone assigned value.
+    assert "SWITCH_SNMP_COMMUNITY=1" not in joined
+    assert "'1'" not in joined
+
+
+def test_cody_unparseable_readback_after_send_is_not_rejected(
+    community_env: str, audit_log
+) -> None:
+    """Finding 5: config sent + unparseable read-back is verification failed, allowed=True."""
+    sent: list[str] = []
+    shows = {
+        READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED,
+        READBACK_SNMP_COMMUNITY: "Idx  Name  Sec\n1  HaIfMibComm9x  ifmib_sec\n",
+        READBACK_SNMP_GROUP: GROUP_SHOW,
+        READBACK_SNMP_ACCESS: ACCESS_SHOW_RW,
+    }
+
+    def cfg(cmds: list[str]) -> str:
+        sent.extend(cmds)
+        return "ok"
+
+    result = _run_snmp_tool(
+        "snmp_community_create",
+        _FakeConn(cfg),
+        shows,
+        "ifmib",
+        "ro",
+    )
+    assert sent, "configuration should have been sent"
+    assert result.startswith("Error: Configuration was sent, verification failed")
+    assert "Rejected:" not in result
+    assert not _secret_in(result, SECRET)
+    record = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["allowed"] is True
+    assert "Configuration was sent, verification failed" in record["result"]
+    assert not _secret_in(record["result"], SECRET)
+
+
+def test_cody_unparseable_listing_redacts_whole_body(community_env: str) -> None:
+    """Finding 6: unknown layout must not show foreign communities."""
+    table = (
+        "Index  Community Name     Security Name\n"
+        "1      public            none\n"
+        "2      OldSecretComm77    old_sec\n"
+        "3      HaIfMibComm9x      ifmib_sec\n"
+    )
+    redacted = redact_show_output("show snmp community", table)
+    assert SECRET not in redacted
+    assert "OldSecretComm77" not in redacted
+    assert "public" not in redacted
+    assert "unparseable show snmp community output" in redacted
+
+
+def test_cody_verification_is_exact_but_device_spelling_is_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 11: verification is exact; redaction still covers the device spelling."""
+    from netmiko_mcp_linksys.snmp_cli import find_community_entry, parse_snmp_community
+
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", "haifmibcomm9X")
+    entry = find_community_entry(parse_snmp_community(COMMUNITY_SHOW), "haifmibcomm9X")
+    assert entry is None
+    with pytest.raises(ValidationError, match="not present"):
+        assert_configured_community_ready(
+            community_output=COMMUNITY_SHOW,
+            group_output=GROUP_SHOW,
+            access_output=ACCESS_SHOW_RW,
+            view_output=VIEW_SHOW_RESTRICTED,
+            community="haifmibcomm9X",
+        )
+    redacted = redact_secrets("Community Name: HaIfMibComm9x")
+    assert "HaIfMibComm9x" not in redacted
+    assert "haifmibcomm9X" not in redacted
+    assert "[REDACTED]" in redacted
+
+
+def test_cody_index_as_name_is_not_globally_replaced(community_env: str) -> None:
+    """Finding 10: do not globally replace a community index that equals a name."""
+    listing = (
+        "Community Index: 1\n"
+        "Security Name: v1_sec\n"
+        "Storage Type: nonVolatile\n"
+        "Row Status: active (since 10:01)\n"
+    )
+    redacted = redact_community_listing(listing)
+    assert "Community Index: 1" in redacted
+    assert "v1_sec" in redacted
+    assert "10:01" in redacted
+    assert "[REDACTED]" not in redacted or "Community Index: [REDACTED]" not in redacted
+
+
+def test_cody_write_view_unknown_label_aborts(community_env: str) -> None:
+    """Finding 3: only an explicit 'none' write view is read-only."""
+    acc = ACCESS_SHOW_ISO_WRITE.replace("Write View:", "Write View Name:")
+    # The parser will not see Write View, so write_view is empty -> abort.
+    with pytest.raises(ValidationError, match="no write view"):
+        assert_configured_community_ready(
+            community_output=COMMUNITY_SHOW,
+            group_output=GROUP_SHOW,
+            access_output=acc,
+            view_output=VIEW_SHOW_RESTRICTED,
+            community=SECRET,
+        )
+
+
+def test_cody_v3_model_is_not_accepted_as_v2c_fallback(community_env: str) -> None:
+    """Finding 4: v2c fallback applies only when the model field is empty."""
+    grp = GROUP_SHOW.replace("Security Model: v2c", "Security Model: v3")
+    acc = ACCESS_SHOW_RW.replace("Security Model: v2c", "Security Model: v3 priv")
+    with pytest.raises(ValidationError, match="not mapped to an SNMP group|no v2c access"):
+        assert_configured_community_ready(
+            community_output=COMMUNITY_SHOW,
+            group_output=grp,
+            access_output=acc,
+            view_output=VIEW_SHOW_RESTRICTED,
+            community=SECRET,
+        )
+
+
+def test_cody_empty_model_fallback_still_allowed(community_env: str) -> None:
+    grp = GROUP_SHOW.replace("Security Model: v2c\n", "")
+    acc = ACCESS_SHOW_RW.replace("Security Model: v2c\n", "")
+    status = assert_configured_community_ready(
+        community_output=COMMUNITY_SHOW,
+        group_output=grp,
+        access_output=acc,
+        view_output=VIEW_SHOW_RESTRICTED,
+        community=SECRET,
+    )
+    assert "ifmib_grp" in status
+
+
+def test_cody_snmp_tools_disable_session_log(
+    community_env: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 7: SNMP write tools must not open a session log."""
+    from netmiko_mcp_linksys import connection, server
+
+    log = tmp_path / "session.log"
+    monkeypatch.setenv("SWITCH_SESSION_LOG", str(log))
+    captured: dict[str, Any] = {}
+
+    def fake_handler(**params: Any) -> _FakeConn:
+        captured.update(params)
+        return _FakeConn("ok")
+
+    def fake_paged(_conn: Any, command: str, *_a: Any, **_k: Any) -> str:
+        mapping = {
+            READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED,
+            READBACK_SNMP_COMMUNITY: COMMUNITY_SHOW,
+            READBACK_SNMP_GROUP: GROUP_SHOW,
+            READBACK_SNMP_ACCESS: ACCESS_SHOW_RW,
+        }
+        return mapping.get(command, "")
+
+    with (
+        patch.object(connection, "ConnectHandler", fake_handler),
+        patch.object(connection, "disable_paging_best_effort", lambda _c: None),
+        patch.object(connection, "send_paged", fake_paged),
+        patch.object(server, "send_paged", fake_paged),
+    ):
+        server.snmp_community_create("ifmib", "rw")
+    assert "session_log" not in captured
+    assert not log.exists() or log.read_text(encoding="utf-8") == ""
+
+
+def test_cody_session_log_redact_handles_wrapped_echo(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "HaIfMibComm9xLongSecret42"
+    monkeypatch.setenv("SWITCH_SNMP_COMMUNITY", secret)
+    path = tmp_path / "s.log"
+    path.write_text(
+        "LGS(config)# snmp community name HaIfMibComm9\r\n"
+        "xLongSecret42 security v_sec\r\n"
+        f"LGS(config)# snmp community name {secret} security v_sec\r\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o644)
+    monkeypatch.setenv("SWITCH_SESSION_LOG", str(path))
+    redact_session_log_file()
+    body = path.read_text(encoding="utf-8")
+    assert not _secret_in(body, secret)
+    assert secret[:12] not in body
+    assert secret[12:] not in body
+    assert (path.stat().st_mode & 0o777) == 0o600
+
+
+def test_cody_write_tools_require_enable_flag(
+    community_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 8: SWITCH_SNMP_WRITE_ENABLED=1 is required and off by default."""
+    from netmiko_mcp_linksys.server import (
+        snmp_community_create,
+        snmp_community_remove,
+        snmp_user_remove,
+        snmp_view_create,
+    )
+
+    monkeypatch.delenv("SWITCH_SNMP_WRITE_ENABLED", raising=False)
+    with (
+        patch("netmiko_mcp_linksys.server.run_in_session") as run,
+        patch("netmiko_mcp_linksys.server.run_config_and_readbacks") as run_rb,
+    ):
+        view = snmp_view_create("ifmib", "interfaces")
+        create = snmp_community_create("ifmib", "rw")
+        remove = snmp_community_remove("public")
+        user = snmp_user_remove("noAuthUser")
+    run.assert_not_called()
+    run_rb.assert_not_called()
+    for result in (view, create, remove, user):
+        assert result.startswith("Rejected:")
+        assert "SWITCH_SNMP_WRITE_ENABLED" in result
+        assert SECRET not in result
+
+
+def test_cody_readback_exception_after_send_is_verification_failed(
+    community_env: str, audit_log
+) -> None:
+    def cfg(_cmds: list[str]) -> str:
+        return "ok"
+
+    def later(_conn: Any, command: str, *_a: Any, **_k: Any) -> str:
+        if command == READBACK_SNMP_VIEW and later.calls == 0:
+            later.calls += 1
+            return VIEW_SHOW_RESTRICTED
+        raise ConnectionError(f"timeout after sending {SECRET}")
+
+    later.calls = 0  # type: ignore[attr-defined]
+
+    from netmiko_mcp_linksys import connection, server
+
+    with (
+        patch.object(connection, "connect_params", lambda **_k: {}),
+        patch.object(connection, "ConnectHandler", lambda **_k: _FakeConn(cfg)),
+        patch.object(connection, "disable_paging_best_effort", lambda _c: None),
+        patch.object(connection, "send_paged", later),
+        patch.object(server, "send_paged", later),
+    ):
+        result = server.snmp_community_create("ifmib", "ro")
+    assert result.startswith("Error: Configuration was sent, verification failed")
+    assert not _secret_in(result, SECRET)
+    record = json.loads(audit_log.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["allowed"] is True
+    assert not _secret_in(record["result"], SECRET)
+

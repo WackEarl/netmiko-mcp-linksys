@@ -64,6 +64,7 @@ from netmiko_mcp_linksys.validation import (
     redact_secrets,
     reject_if_protected,
     reject_unsafe_show_command,
+    require_snmp_write_enabled,
     validate_community_remove_name,
     validate_description,
     validate_port,
@@ -144,6 +145,25 @@ def startup_checks() -> list[str]:
         warnings.append(str(exc))
         print(f"netmiko-mcp-linksys: warning: {exc}", file=sys.stderr, flush=True)
     session_log_path()
+    if "SWITCH_SNMP_COMMUNITY" in os.environ:
+        try:
+            validate_snmp_community_secret()
+        except ValidationError as exc:
+            # Invalid values are not used for redaction; never echo them.
+            warnings.append(str(exc))
+            print(
+                f"netmiko-mcp-linksys: warning: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+    write_flag = (os.environ.get("SWITCH_SNMP_WRITE_ENABLED") or "").strip()
+    if write_flag != "1":
+        message = (
+            "SNMP write tools are disabled (SWITCH_SNMP_WRITE_ENABLED "
+            "is not 1) until the CLI syntax is live-confirmed."
+        )
+        warnings.append(message)
+        print(f"netmiko-mcp-linksys: warning: {message}", file=sys.stderr, flush=True)
     return warnings
 
 
@@ -544,6 +564,12 @@ def _snmp_fail(tool: str, params: dict[str, Any], exc: BaseException, *, allowed
     return _fail(tool, params, prefix + str(exc), allowed=allowed)
 
 
+def _verification_failed(exc: BaseException) -> SwitchConnectionError:
+    return SwitchConnectionError(
+        "Configuration was sent, verification failed: " + redact_secrets(str(exc))
+    )
+
+
 @mcp.tool()
 def snmp_view_create(view_name: str, subtree: str) -> str:
     """Add one allow-listed included subtree to an SNMP view. Does not save.
@@ -554,10 +580,16 @@ def snmp_view_create(view_name: str, subtree: str) -> str:
     """
     params = {"view_name": view_name, "subtree": subtree}
     try:
+        require_snmp_write_enabled()
         view_name = validate_snmp_name(view_name, what="view name")
         oid = normalize_subtree(subtree)
         commands = build_view_create_commands(view_name, oid)
-        output = run_config_and_readbacks(commands, [READBACK_SNMP_VIEW])
+        output = run_config_and_readbacks(
+            commands,
+            [READBACK_SNMP_VIEW],
+            enable_session_log=False,
+            wide_terminal=True,
+        )
         views = parse_snmp_viewtree(output)
         present = any(
             item.name.lower() == view_name.lower() and item.oid == oid
@@ -622,6 +654,7 @@ def snmp_community_create(view_name: str, access: str) -> str:
     """
     params = {"view_name": view_name, "access": access}
     try:
+        require_snmp_write_enabled()
         view_name = validate_snmp_name(view_name, what="view name")
         access = validate_snmp_access(access)
         community = validate_snmp_community_secret()
@@ -630,39 +663,44 @@ def snmp_community_create(view_name: str, access: str) -> str:
         def _run(conn: Any) -> str:
             _precheck_view_for_community(conn, view_name)
             _send_config(conn, commands)
-            community_out = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
-            group_out = _snmp_exec(conn, READBACK_SNMP_GROUP)
-            access_out = _snmp_exec(conn, READBACK_SNMP_ACCESS)
-            view_out = _snmp_exec(conn, READBACK_SNMP_VIEW)
-            status = assert_configured_community_ready(
-                community_output=community_out,
-                group_output=group_out,
-                access_output=access_out,
-                view_output=view_out,
-                community=community,
-            )
-            return (
-                format_sent_commands(commands)
-                + "\n\nConfiguration sent.\n"
-                + f"--- {READBACK_SNMP_COMMUNITY} ---\n"
-                + redact_show_output(READBACK_SNMP_COMMUNITY, community_out)
-                + "\n"
-                + f"--- {READBACK_SNMP_GROUP} ---\n"
-                + redact_show_output(READBACK_SNMP_GROUP, group_out)
-                + "\n"
-                + f"--- {READBACK_SNMP_ACCESS} ---\n"
-                + redact_show_output(READBACK_SNMP_ACCESS, access_out)
-                + "\n"
-                + f"--- {READBACK_SNMP_VIEW} ---\n"
-                + redact_show_output(READBACK_SNMP_VIEW, view_out)
-                + "\n\n"
-                + "Read-back check: "
-                + status
-                + "\n"
-                + _snmp_syntax_note()
-            )
+            try:
+                community_out = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
+                group_out = _snmp_exec(conn, READBACK_SNMP_GROUP)
+                access_out = _snmp_exec(conn, READBACK_SNMP_ACCESS)
+                view_out = _snmp_exec(conn, READBACK_SNMP_VIEW)
+                status = assert_configured_community_ready(
+                    community_output=community_out,
+                    group_output=group_out,
+                    access_output=access_out,
+                    view_output=view_out,
+                    community=community,
+                )
+                return (
+                    format_sent_commands(commands)
+                    + "\n\nConfiguration sent.\n"
+                    + f"--- {READBACK_SNMP_COMMUNITY} ---\n"
+                    + redact_show_output(READBACK_SNMP_COMMUNITY, community_out)
+                    + "\n"
+                    + f"--- {READBACK_SNMP_GROUP} ---\n"
+                    + redact_show_output(READBACK_SNMP_GROUP, group_out)
+                    + "\n"
+                    + f"--- {READBACK_SNMP_ACCESS} ---\n"
+                    + redact_show_output(READBACK_SNMP_ACCESS, access_out)
+                    + "\n"
+                    + f"--- {READBACK_SNMP_VIEW} ---\n"
+                    + redact_show_output(READBACK_SNMP_VIEW, view_out)
+                    + "\n\n"
+                    + "Read-back check: "
+                    + status
+                    + "\n"
+                    + _snmp_syntax_note()
+                )
+            except (ValidationError, SwitchConnectionError) as exc:
+                raise _verification_failed(exc) from None
 
-        body = run_in_session(_run)
+        body = run_in_session(
+            _run, enable_session_log=False, wide_terminal=True
+        )
     except ValidationError as exc:
         return _snmp_fail("snmp_community_create", params, exc, allowed=False)
     except SwitchConnectionError as exc:
@@ -680,6 +718,7 @@ def snmp_community_remove(name: str) -> str:
     """
     params = {"name": name}
     try:
+        require_snmp_write_enabled()
         community = validate_snmp_community_secret()
         requested = validate_community_remove_name(name, community)
 
@@ -699,37 +738,42 @@ def snmp_community_remove(name: str) -> str:
             exact = resolve_removable_community_name(requested, entries, community)
             commands = build_community_remove_commands(exact)
             _send_config(conn, commands)
-            after = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
-            still = any(
-                (item.name.lower() == exact.lower())
-                or (item.index.lower() == exact.lower())
-                for item in parse_snmp_community(after)
-            )
-            if still:
-                note = (
-                    f"Read-back check: {exact} is still present in "
-                    "show snmp community after the no-command."
+            try:
+                after = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
+                still = any(
+                    (item.name.lower() == exact.lower())
+                    or (item.index.lower() == exact.lower())
+                    for item in parse_snmp_community(after)
                 )
-            else:
-                note = (
-                    f"Read-back check: {exact} is no longer present in "
-                    "show snmp community. "
+                if still:
+                    note = (
+                        f"Read-back check: {exact} is still present in "
+                        "show snmp community after the no-command."
+                    )
+                else:
+                    note = (
+                        f"Read-back check: {exact} is no longer present in "
+                        "show snmp community. "
+                        + status
+                    )
+                return (
+                    format_sent_commands(commands)
+                    + "\n\n"
                     + status
+                    + "\n\nConfiguration sent.\n"
+                    + f"--- {READBACK_SNMP_COMMUNITY} ---\n"
+                    + redact_show_output(READBACK_SNMP_COMMUNITY, after)
+                    + "\n\n"
+                    + note
+                    + "\n"
+                    + _snmp_syntax_note()
                 )
-            return (
-                format_sent_commands(commands)
-                + "\n\n"
-                + status
-                + "\n\nConfiguration sent.\n"
-                + f"--- {READBACK_SNMP_COMMUNITY} ---\n"
-                + redact_show_output(READBACK_SNMP_COMMUNITY, after)
-                + "\n\n"
-                + note
-                + "\n"
-                + _snmp_syntax_note()
-            )
+            except (ValidationError, SwitchConnectionError) as exc:
+                raise _verification_failed(exc) from None
 
-        body = run_in_session(_run)
+        body = run_in_session(
+            _run, enable_session_log=False, wide_terminal=True
+        )
     except ValidationError as exc:
         return _snmp_fail("snmp_community_remove", params, exc, allowed=False)
     except SwitchConnectionError as exc:
@@ -745,6 +789,7 @@ def snmp_user_remove(name: str) -> str:
     """
     params = {"name": name}
     try:
+        require_snmp_write_enabled()
         name = validate_user_remove_name(name)
         commands = build_user_remove_commands(name)
 
@@ -760,27 +805,32 @@ def snmp_user_remove(name: str) -> str:
                     + _snmp_syntax_note()
                 )
             _send_config(conn, commands)
-            after = _snmp_exec(conn, READBACK_SNMP_USER)
-            if user_present(after, name):
-                note = (
-                    f"Read-back check: {name} is still present in show snmp user."
+            try:
+                after = _snmp_exec(conn, READBACK_SNMP_USER)
+                if user_present(after, name):
+                    note = (
+                        f"Read-back check: {name} is still present in show snmp user."
+                    )
+                else:
+                    note = (
+                        f"Read-back check: {name} is no longer present in show snmp user."
+                    )
+                return (
+                    format_sent_commands(commands)
+                    + "\n\nConfiguration sent.\n"
+                    + f"--- {READBACK_SNMP_USER} ---\n"
+                    + redact_show_output(READBACK_SNMP_USER, after)
+                    + "\n\n"
+                    + note
+                    + "\n"
+                    + _snmp_syntax_note()
                 )
-            else:
-                note = (
-                    f"Read-back check: {name} is no longer present in show snmp user."
-                )
-            return (
-                format_sent_commands(commands)
-                + "\n\nConfiguration sent.\n"
-                + f"--- {READBACK_SNMP_USER} ---\n"
-                + redact_show_output(READBACK_SNMP_USER, after)
-                + "\n\n"
-                + note
-                + "\n"
-                + _snmp_syntax_note()
-            )
+            except (ValidationError, SwitchConnectionError) as exc:
+                raise _verification_failed(exc) from None
 
-        body = run_in_session(_run)
+        body = run_in_session(
+            _run, enable_session_log=False, wide_terminal=True
+        )
     except ValidationError as exc:
         return _snmp_fail("snmp_user_remove", params, exc, allowed=False)
     except SwitchConnectionError as exc:

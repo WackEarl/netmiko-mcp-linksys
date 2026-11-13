@@ -35,9 +35,9 @@ REDACTED_COMMUNITY = "[REDACTED]"
 # View / group / security identifiers. Capped at 28 so derived names
 # "{view}_grp" / "{view}_sec" stay within the CLI's 32-character limit.
 SNMP_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,27}$")
-SNMP_COMMUNITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,63}$")
+SNMP_COMMUNITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]{7,31}$")
 SNMP_COMMUNITY_MIN = 8
-SNMP_COMMUNITY_MAX = 64
+SNMP_COMMUNITY_MAX = 32
 DEFAULT_SNMP_COMMUNITIES = frozenset({"public", "private"})
 SNMP_REMOVE_COMMUNITY_ALLOWLIST = frozenset({"public", "private"})
 SNMP_REMOVE_USER_ALLOWLIST = frozenset({"noAuthUser"})
@@ -61,20 +61,96 @@ SNMP_RESERVED_NAMES = frozenset(
 )
 
 
+# "snmp community name <secret> security" may wrap mid-secret (ISS
+# terminals are often ~80-144 columns). The community token is only
+# [A-Za-z0-9_] plus wrap whitespace, so this cannot eat later table
+# labels such as "Security Name". The keyword "security" is matched
+# case-sensitively (CLI spelling).
+_COMMUNITY_CMD_SPAN_RE = re.compile(
+    r"snmp[ \t]+community[ \t]+name(?:\s|\\[nrt])+"
+    r"[A-Za-z0-9_\r\n\\]+"
+    r"(?:\s|\\[nrt])+security\b"
+)
+
+
+def valid_community_for_redaction() -> str | None:
+    """Return SWITCH_SNMP_COMMUNITY only when it passes validation.
+
+    A short or malformed value must not be used for replacement; it
+    would mangle unrelated output (for example ``1`` inside ``Gi0/1``).
+    """
+    if "SWITCH_SNMP_COMMUNITY" not in os.environ:
+        return None
+    raw = os.environ["SWITCH_SNMP_COMMUNITY"]
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return validate_snmp_community_secret(raw)
+    except ValidationError:
+        return None
+
+
+def redact_community_command_spans(text: str) -> str:
+    """Replace a (possibly wrapped) community-config command with a redacted span."""
+    return _COMMUNITY_CMD_SPAN_RE.sub(
+        "snmp community name " + REDACTED_COMMUNITY + " security",
+        text,
+    )
+
+
+def _secret_variants(secret: str) -> list[str]:
+    """Exact, case-preserving, re.escape, and repr/escape forms, longest first."""
+    escaped = re.escape(secret)
+    variants = {
+        secret,
+        escaped,
+        escaped.replace("\\", "\\\\"),
+        repr(secret),
+        repr(escaped),
+        repr(secret)[1:-1],
+        repr(escaped)[1:-1],
+    }
+    return sorted((item for item in variants if item), key=len, reverse=True)
+
+
+def _replace_secret_and_variants(text: str, secret: str, token: str) -> str:
+    # Case-insensitive for the raw secret so a different device spelling
+    # cannot leak. Escaped/repr forms are replaced exactly.
+    text = re.sub(re.escape(secret), token, text, flags=re.IGNORECASE)
+    for variant in _secret_variants(secret):
+        if variant and variant in text and variant.lower() != secret.lower():
+            text = text.replace(variant, token)
+    return text
+
+
 def redact_secrets(text: str) -> str:
     """Strip the switch password and SNMP community from shown or logged text.
 
     The community becomes ``[REDACTED]``; the SSH password stays ``***``
-    (existing behaviour). The community is replaced first so a password
-    that happened to be a substring of it cannot leak a suffix.
+    (existing behaviour). Community config-line spans are redacted even
+    when the secret is wrapped across line breaks. The env community is
+    only substituted when it is a valid secret (see
+    valid_community_for_redaction).
     """
-    community = os.environ.get("SWITCH_SNMP_COMMUNITY") or ""
-    if community and community in text:
-        text = text.replace(community, REDACTED_COMMUNITY)
+    text = redact_community_command_spans(text)
+    community = valid_community_for_redaction()
+    if community:
+        text = _replace_secret_and_variants(text, community, REDACTED_COMMUNITY)
     password = os.environ.get("SWITCH_PASSWORD") or ""
     if password and password in text:
         text = text.replace(password, "***")
     return text
+
+
+def require_snmp_write_enabled() -> None:
+    """Fail closed unless SWITCH_SNMP_WRITE_ENABLED=1 (live syntax unconfirmed)."""
+    raw = (os.environ.get("SWITCH_SNMP_WRITE_ENABLED") or "").strip()
+    if raw != "1":
+        raise ValidationError(
+            "SNMP write tools are disabled until the CLI syntax is "
+            "live-confirmed. Set SWITCH_SNMP_WRITE_ENABLED=1 to enable "
+            "them (off by default)."
+        )
 
 
 def validate_snmp_name(name: str, *, what: str = "name") -> str:
@@ -103,14 +179,14 @@ def validate_snmp_community_secret(raw: str | None = None) -> str:
         if "SWITCH_SNMP_COMMUNITY" not in os.environ:
             raise ValidationError(
                 "SWITCH_SNMP_COMMUNITY is not set. Set it to a non-default "
-                "community string (8..64 characters from [A-Za-z0-9._-]). "
+                "community string (8..32 characters from [A-Za-z0-9_]). "
                 "The value is never accepted as a tool argument."
             )
         raw = os.environ["SWITCH_SNMP_COMMUNITY"]
     if not isinstance(raw, str) or not raw:
         raise ValidationError(
             "SWITCH_SNMP_COMMUNITY is empty. Set it to a non-default "
-            "community string (8..64 characters from [A-Za-z0-9._-]). "
+            "community string (8..32 characters from [A-Za-z0-9_]). "
             "The value is not shown."
         )
     # Default names first, even when they are shorter than the minimum,
@@ -124,8 +200,8 @@ def validate_snmp_community_secret(raw: str | None = None) -> str:
         raise ValidationError(
             "SWITCH_SNMP_COMMUNITY is invalid. Use "
             f"{SNMP_COMMUNITY_MIN}..{SNMP_COMMUNITY_MAX} characters from "
-            "[A-Za-z0-9._-], starting with alphanumeric, with no spaces "
-            "or quotes. The value is not shown."
+            "[A-Za-z0-9_], starting with alphanumeric, with no spaces, "
+            "dots, dashes, or quotes. The value is not shown."
         )
     return raw
 

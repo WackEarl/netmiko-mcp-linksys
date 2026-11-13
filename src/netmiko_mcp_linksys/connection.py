@@ -125,6 +125,24 @@ def session_log_path() -> str | None:
         return None
 
 
+def _commands_include_snmp_community(commands: list[str]) -> bool:
+    return any(re.search(r"(?i)\bsnmp\s+community\b", command) for command in commands)
+
+
+def _set_terminal_width_best_effort(conn: Any) -> None:
+    """Widen the CLI if the driver supports it, so a community line is less likely to wrap."""
+    setter = getattr(conn, "set_terminal_width", None)
+    if not callable(setter):
+        return
+    try:
+        setter(511)
+    except (OSError, RuntimeError, ValueError, TypeError, AttributeError) as exc:
+        warn(
+            f"could not set terminal width ({exc}); continuing.",
+            once_key="term-width",
+        )
+
+
 def redact_show_output(command: str, text: str) -> str:
     """Redact secrets in exec output. Community listings are fully masked."""
     if re.search(r"(?i)\bshow\s+snmp\s+community\b", command.strip()):
@@ -146,7 +164,9 @@ def redact_session_log_file() -> None:
         return
     try:
         original = path.read_text(encoding="utf-8", errors="replace")
-        redacted = redact_community_listing(original)
+        # Do not use listing fail-closed here: a session log is not a
+        # show snmp community table and must not be replaced wholesale.
+        redacted = redact_secrets(original)
         if redacted == original:
             return
         path.write_text(redacted, encoding="utf-8")
@@ -158,7 +178,7 @@ def redact_session_log_file() -> None:
         )
 
 
-def connect_params() -> dict[str, Any]:
+def connect_params(*, enable_session_log: bool = True) -> dict[str, Any]:
     host = (os.environ.get("SWITCH_HOST") or "").strip()
     username = (os.environ.get("SWITCH_USER") or "").strip()
     password = os.environ.get("SWITCH_PASSWORD") or ""
@@ -200,7 +220,7 @@ def connect_params() -> dict[str, Any]:
         "fast_cli": False,
         "read_timeout_override": read_timeout(),
     }
-    log_path = session_log_path()
+    log_path = session_log_path() if enable_session_log else None
     if log_path is not None:
         # netmiko masks the password/secret in the session log (no_log), and
         # only channel reads are recorded (record_writes stays False).
@@ -232,14 +252,24 @@ def disable_paging_best_effort(conn: Any) -> None:
 
 
 @contextmanager
-def session() -> Iterator[Any]:
-    """Yield a connected ConnectHandler, exclusive to one caller at a time."""
-    params = connect_params()
+def session(
+    *,
+    enable_session_log: bool = True,
+    wide_terminal: bool = False,
+) -> Iterator[Any]:
+    """Yield a connected ConnectHandler, exclusive to one caller at a time.
+
+    SNMP write tools pass enable_session_log=False so a community echo
+    cannot sit in the session log in the clear until disconnect.
+    """
+    params = connect_params(enable_session_log=enable_session_log)
     with _LOCK:
         conn = None
         try:
             conn = ConnectHandler(**params)
             disable_paging_best_effort(conn)
+            if wide_terminal:
+                _set_terminal_width_best_effort(conn)
             yield conn
         except ValidationError:
             raise
@@ -422,6 +452,14 @@ def _send_config(conn: Any, commands: list[str]) -> str:
             read_timeout=read_timeout(),
         )
     except Exception as exc:
+        if _commands_include_snmp_community(commands):
+            # Never return or log str(exc): netmiko cmd_verify timeouts
+            # embed repr(re.escape(command)), which bypasses exact redaction.
+            raise ConnectionError(
+                "Device rejected the configuration sequence "
+                f"({type(exc).__name__}). The exception text is omitted "
+                "because the sequence may include a community string."
+            ) from None
         raise ConnectionError(redact_secrets(str(exc))) from None
     text = output if isinstance(output, str) else str(output)
     if config_output_is_error(text, commands=commands):
@@ -454,9 +492,17 @@ def run_config_and_readback(commands: list[str], readback: str) -> str:
         )
 
 
-def run_config_and_readbacks(commands: list[str], readbacks: list[str]) -> str:
+def run_config_and_readbacks(
+    commands: list[str],
+    readbacks: list[str],
+    *,
+    enable_session_log: bool = True,
+    wide_terminal: bool = False,
+) -> str:
     """Apply a config set, then run one or more exec read-backs in the same session."""
-    with session() as conn:
+    with session(
+        enable_session_log=enable_session_log, wide_terminal=wide_terminal
+    ) as conn:
         _send_config(conn, commands)
         sections: list[str] = ["Configuration sent."]
         for readback in readbacks:
@@ -471,9 +517,16 @@ def run_config_and_readbacks(commands: list[str], readbacks: list[str]) -> str:
         return "\n".join(sections)
 
 
-def run_in_session(callback: Any) -> Any:
+def run_in_session(
+    callback: Any,
+    *,
+    enable_session_log: bool = True,
+    wide_terminal: bool = False,
+) -> Any:
     """Run ``callback(conn)`` inside a locked session. Output must be redacted by the caller if needed."""
-    with session() as conn:
+    with session(
+        enable_session_log=enable_session_log, wide_terminal=wide_terminal
+    ) as conn:
         return callback(conn)
 
 
