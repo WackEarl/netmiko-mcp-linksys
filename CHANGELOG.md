@@ -12,7 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `config_output_is_error` now only treats lines that start with `%` as
   device errors, so echoed commands and prompts are ignored. Allowed
   descriptions such as `Error LED` and `Invalid Port` are no longer
-  reported as rejected when the configuration was accepted
+  reported as rejected when the configuration was accepted. Each line is
+  run through the same ANSI/control stripper as the output cleanup
+  (including the terminated-OSC rule) before the `%` check, so a
+  color-prefixed `% Invalid input` is still detected
   ([#3](https://github.com/WackEarl/netmiko-mcp-linksys/issues/3)).
 
 ## [0.1.2] - 2026-11-12

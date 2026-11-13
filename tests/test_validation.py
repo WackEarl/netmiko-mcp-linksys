@@ -204,3 +204,10 @@ def test_config_output_ignores_error_words_without_percent() -> None:
     assert config_output_is_error("Invalid input") is False
     assert config_output_is_error("") is False
     assert config_output_is_error("LGS328PC#") is False
+
+
+def test_config_output_detects_ansi_prefixed_percent_error() -> None:
+    assert config_output_is_error("\x1b[31m% Invalid input detected at '^' marker.") is True
+    assert config_output_is_error("\x1b[31m% Invalid input detected\x1b[0m") is True
+    # Terminated OSC (BEL) is stripped; the following '%' error still counts.
+    assert config_output_is_error("\x1b]0;title\x07% Invalid input detected") is True

@@ -18,6 +18,7 @@ from typing import Any
 
 from netmiko import ConnectHandler
 
+from netmiko_mcp_linksys.output import strip_controls as _strip_controls
 from netmiko_mcp_linksys.validation import (
     ValidationError,
     config_output_is_error,
@@ -50,18 +51,6 @@ PAGER_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
-# CSI (ESC [ params intermediates final), OSC (ESC ] ... BEL/ST), charset
-# selection (ESC ( B), and the common two-byte ESC 7/8/=/>/D/E/H/M/c.
-# Any ESC left after this is dropped on its own (netmiko strips per read,
-# which can orphan an ESC).
-ANSI_RE = re.compile(
-    r"\x1b\[[0-?]*[ -/]*[@-~]"
-    r"|\x1b\][^\x07\x1b\n]*(?:\x07|\x1b\\)"
-    r"|\x1b[()#%][A-Za-z0-9]"
-    r"|\x1b[78=>DEHMc\\]"
-)
-# C0 controls other than \t, \n, \r, \b (handled separately), plus DEL.
-CONTROL_RE = re.compile(r"[\x00-\x07\x0b\x0c\x0e-\x1f\x7f]")
 # Marks where a pager prompt was cut; blank lines right after it are erase
 # leftovers (netmiko turns the pager's "\r    \r" into newlines).
 PAGE_BREAK = "\ue000"
@@ -231,32 +220,11 @@ def session() -> Iterator[Any]:
                     pass
 
 
-def _apply_backspaces(text: str) -> str:
-    if "\b" not in text:
-        return text
-    out: list[str] = []
-    for char in text:
-        if char == "\b":
-            if out and out[-1] != "\n":
-                out.pop()
-        else:
-            out.append(char)
-    return "".join(out)
-
-
 def _prompt_regex(conn: Any) -> re.Pattern[str]:
     base = getattr(conn, "base_prompt", None)
     if isinstance(base, str) and base.strip():
         return re.compile(r"^\s*" + re.escape(base.strip()) + r"[^\r\n#>]*[#>]\s*$")
     return re.compile(r"^\s*[\w.\-]+[^\r\n#>]*[#>]\s*$")
-
-
-def _strip_controls(raw: str) -> str:
-    """Remove ANSI/VT100 sequences, orphaned ESC bytes, backspaces, and other
-    control characters (keeps \t, \n, \r and the PAGE_BREAK marker)."""
-    text = ANSI_RE.sub("", raw).replace("\x1b", "")
-    text = _apply_backspaces(text)
-    return CONTROL_RE.sub("", text)
 
 
 def _visible_tail(raw: str) -> str:

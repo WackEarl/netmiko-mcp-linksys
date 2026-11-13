@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import re
 
+from netmiko_mcp_linksys.output import strip_controls
+
 PORT_RE = re.compile(r"^0/([1-9]|1[0-9]|2[0-8])$")
 POE_PORT_RE = re.compile(r"^0/([1-9]|1[0-9]|2[0-4])$")
 DESCRIPTION_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,32}$")
@@ -113,13 +115,16 @@ def config_output_is_error(output: str) -> bool:
 
     Prompt lines and echoed command lines are ignored, so a description
     such as "Error LED" or "Invalid Port" is not treated as a rejection.
-    Only stripped lines that start with '%' count (the LGS/ISS format is
-    "% Invalid input detected at '^' marker.").
+    Only lines that start with '%' after ANSI/control stripping count
+    (the LGS/ISS format is "% Invalid input detected at '^' marker.").
+    Each line is run through strip_controls first (same helper as the
+    output cleanup, including the terminated-OSC rule) so a colored
+    error such as CSI-prefixed "% Invalid input" is still detected.
     """
     if not output:
         return False
     for line in output.splitlines():
-        stripped = line.strip()
+        stripped = strip_controls(line).strip()
         if not stripped:
             continue
         if stripped.startswith("%"):
