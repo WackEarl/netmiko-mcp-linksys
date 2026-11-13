@@ -133,9 +133,52 @@ def _commands_include_snmp_community(commands: list[str]) -> bool:
     return any(re.search(r"(?i)\bsnmp\s+community\b", command) for command in commands)
 
 
+# Whitespace normalization matches the show-tool command filter
+# (" ".join(command.split())). "sh" is the shortest show prefix; kind
+# prefixes start at 2 characters so "co"/"vi"/"us" are fail-closed without
+# also matching unrelated tokens such as "group".
+_MIN_SHOW_PREFIX = 2
+_MIN_SENSITIVE_KIND_PREFIX = 2
+_SENSITIVE_SNMP_KINDS = ("community", "viewtree", "user")
+
+
+def _normalized_command_words(command: str) -> list[str]:
+    """Collapse ASCII whitespace like validate_command, then lower-case."""
+    return " ".join(command.split()).lower().split()
+
+
+def _is_command_prefix(submitted: str, full: str, *, min_len: int) -> bool:
+    return len(submitted) >= min_len and full.startswith(submitted)
+
+
+def _snmp_sensitive_kind(command: str) -> str | None:
+    """Return community/viewtree/user if this is a sensitive SNMP show.
+
+    Accepts abbreviated first and kind words (``sh snmp comm``) by prefix,
+    case-insensitively, with any extra trailing words. ``snmp`` itself is
+    matched in full.
+    """
+    words = _normalized_command_words(command)
+    if len(words) < 3:
+        return None
+    show_w, snmp_w, kind = words[0], words[1], words[2]
+    if not _is_command_prefix(show_w, "show", min_len=_MIN_SHOW_PREFIX):
+        return None
+    if snmp_w != "snmp":
+        return None
+    for full in _SENSITIVE_SNMP_KINDS:
+        if _is_command_prefix(kind, full, min_len=_MIN_SENSITIVE_KIND_PREFIX):
+            return full
+    return None
+
+
+def _is_snmp_sensitive_show(command: str) -> bool:
+    return _snmp_sensitive_kind(command) is not None
+
+
 def redact_show_output(command: str, text: str) -> str:
     """Redact secrets in exec output. Community listings are fully masked."""
-    if re.search(r"(?i)\bshow\s+snmp\s+community\b", command.strip()):
+    if _snmp_sensitive_kind(command) == "community":
         return redact_community_listing(text)
     return redact_secrets(text)
 
@@ -376,10 +419,17 @@ def send_paged(
             if "\n" in buffer and prompt_re.search(tail):
                 return clean_output(buffer, command, prompt_re)
         elif time.monotonic() > deadline:
+            if _is_snmp_sensitive_show(command):
+                # Fail closed: do not echo a possibly secret last line
+                # (foreign community, or unknown user-key layout).
+                raise ConnectionError(
+                    f"No prompt after {command!r} ({limit:g}s without new output, "
+                    f"pages: {pages})."
+                )
             last = _visible_tail(buffer)[-80:]
             raise ConnectionError(
                 f"No prompt after {command!r} ({limit:g}s without new output, "
-                f"pages: {pages}, last line: {redact_secrets(last)!r})."
+                f"pages: {pages}, last line: {redact_show_output(command, last)!r})."
             )
         else:
             time.sleep(poll_interval)
@@ -458,15 +508,6 @@ def build_description_commands(port: str, text: str | None) -> list[str]:
 def send_paged_redacted(conn: Any, command: str) -> str:
     """send_paged, then redact secrets (and community listings)."""
     return redact_show_output(command, send_paged(conn, command))
-
-
-_SNMP_SENSITIVE_SHOW_RE = re.compile(
-    r"(?i)^show\s+snmp\s+(community|viewtree|user)\b"
-)
-
-
-def _is_snmp_sensitive_show(command: str) -> bool:
-    return bool(_SNMP_SENSITIVE_SHOW_RE.search(command.strip()))
 
 
 def run_show(command: str) -> str:
