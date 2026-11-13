@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bind a non-default v2c community from `SWITCH_SNMP_COMMUNITY` (never a
   tool argument; redacted as `[REDACTED]`), remove only `public`/`private`
   after the new community is verified with a restricted view, and remove
-  only `noAuthUser`. POWER-ETHERNET-MIB (`1.3.6.1.2.1.105`) is an optional
-  allow-listed subtree for PoE. Command templates live in `snmp_cli.py`
+  only `noAuthUser`. POWER-ETHERNET-MIB (`1.3.6.1.2.1.105`) is an
+  allow-listed read-view subtree so HA can read PoE. Command templates live in `snmp_cli.py`
   and follow the Linksys LGSXXX CLI manual; they are **not live-confirmed**
   ([#7](https://github.com/WackEarl/netmiko-mcp-linksys/issues/7)).
   SNMP write tools require `SWITCH_SNMP_WRITE_ENABLED=1` (off by default),
@@ -22,14 +22,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (including wrapped lines and `re.escape`/`repr` variants). The community
   charset is `[A-Za-z0-9_]`, length 8–32.
 - `snmp_write_view_create(view_name, subtree)` builds a separate write
-  view: only IF-MIB `1.3.6.1.2.1.2` / `1.3.6.1.2.1.31`, never
-  POWER-ETHERNET-MIB, and always `snmp view <view>
-  1.3.6.1.2.1.2.2.1.7.<ifIndex> excluded` (ifAdminStatus) for each
-  protected port, sent before the included subtree.
+  view from the writable columns only: `ifAdminStatus`
+  (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) and
+  `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`) for PoE on/off
+  from Home Assistant (Vikunja task 48). Whole MIB subtrees are refused.
+  It always sends `snmp view <view> 1.3.6.1.2.1.2.2.1.7.<ifIndex>
+  excluded` for each protected port and, for a view with PoE,
+  `snmp view <view> 1.3.6.1.2.1.105.1.1.1.3.<group>.<port> excluded` for
+  each protected PoE port, all before the included column.
 - `SWITCH_SNMP_PROTECTED_IFINDEXES` (`port=ifIndex,…`): explicit ifIndex
   values for exactly the ports in `SWITCH_PROTECTED_PORTS`. The ifIndex
   is never derived from the port number; without a valid mapping every
   write-view and RW operation refuses (fail-closed).
+- `SWITCH_SNMP_PROTECTED_POE_INDEXES` (`port=<group>.<port>,…`): explicit
+  pethPsePortTable indexes for exactly the PoE ports (`0/1`–`0/24`) of
+  `SWITCH_PROTECTED_PORTS`. Never derived from the port number; without
+  a valid mapping (unset, empty, malformed, duplicate, missing or extra
+  ports) every write view with PoE is refused (fail-closed). 0/15 (EoC
+  converter feeding the Zigbee router) is documented in the README as
+  "do not turn PoE off", not locked.
 
 ### Changed
 
@@ -41,11 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the requested views.
 - The `show snmp viewtree` read-back now verifies write views strictly
   (explicit included/excluded type, all-ones or empty mask, only
-  write-allowed subtrees, every ifAdminStatus exclusion present, no
-  PoE) in `snmp_community_create` and `snmp_community_remove`. Read and
+  write-allowed columns, every ifAdminStatus exclusion present, and every
+  PoE exclusion present when the view includes pethPsePortAdminEnable)
+  in `snmp_community_create` and `snmp_community_remove`. Read and
   write views with an unrecognised (possibly wildcard) mask are refused.
-- `snmp_view_create` refuses `power-ethernet` for a view that is used as a
-  write view or carries ifAdminStatus exclusions, and now runs in a
+- `snmp_view_create` refuses any subtree for a view that is used as a
+  write view or carries protected-port exclusions (whole MIBs would
+  widen the column-only write view), and now runs in a
   single session with the "Configuration was sent, verification failed"
   wrapper for post-send read-back errors.
 
