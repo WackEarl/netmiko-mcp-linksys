@@ -10,7 +10,10 @@ same allow/deny list format (`commands.yml`). Configuration tools send only
 fixed command sequences built by this wrapper; the model never supplies
 free-form config.
 
-**This is 0.1.3.** It includes the fixes from the live tests on an
+**This is 0.2.0.** It adds narrow, unlock-gated SNMP tools (a
+column-only write view, a tool-level lock on the protected ports, and
+`SWITCH_SNMP_WRITE_ENABLED` off by default) and includes the fixes from
+the live tests on an
 LGS328PC with firmware 1.01.02.02 (SSH with `ssh-rsa` via paramiko 4.0.0;
 login lands directly in privilege 15 with prompt `LGS328PC#`; no banner or
 second login prompt). See [Live-test status](#live-test-status).
@@ -21,7 +24,7 @@ The intended way to run this server is the packaged entrypoint, pinned to a
 tag:
 
 ```bash
-uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.3 netmiko-mcp-linksys
+uvx --from git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.2.0 netmiko-mcp-linksys
 ```
 
 From a local checkout:
@@ -40,7 +43,7 @@ A compatibility shim, `lgs_mcp.py`, exists only for the older hub invocation
 `python /config/netmiko/lgs_mcp.py`. That file is not a standalone
 implementation: it imports `netmiko_mcp_linksys`. Prefer the `uvx --from ...
 netmiko-mcp-linksys` entry above. If you must keep the old command, add
-`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.3` so the
+`--with git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.2.0` so the
 package is installed in that environment.
 
 ## Environment variables
@@ -51,7 +54,7 @@ package is installed in that environment.
 | `SWITCH_USER` | yes (at tool call) | SSH username. |
 | `SWITCH_PASSWORD` | yes (at tool call) | SSH password. Never logged or returned. |
 | `SWITCH_SNMP_COMMUNITY` | yes before `snmp_community_create` / `snmp_community_remove` | SNMPv2c community string for the new, non-default community. Never a tool argument, never logged or returned (shown as `[REDACTED]`). Must not be `public` or `private`; 8–32 characters from `[A-Za-z0-9_]` (no dots or dashes). An invalid value is not used for redaction. |
-| `SWITCH_SNMP_WRITE_ENABLED` | yes (`1`) before any SNMP write tool | Hard gate, **off by default**. SNMP write tools refuse unless this is exactly `1`. Leave it unset until Redy has confirmed the CLI syntax live. |
+| `SWITCH_SNMP_WRITE_ENABLED` | yes (`1`) before any SNMP write tool | Hard gate, **off by default**. SNMP write tools refuse unless this is exactly `1`. Leave it unset until the remaining unconfirmed CLI (community create/remove) has been verified live. |
 | `SWITCH_DEVICE_TYPE` | no | netmiko device type. Default: `cisco_s300`. |
 | `SWITCH_KNOWN_HOSTS` | yes (at tool call) | Path to an OpenSSH `known_hosts` file with the switch host key. System host keys are not used. |
 | `SWITCH_PROTECTED_PORTS` | yes before any disable / PoE-off | Comma-separated ports (e.g. `0/24,0/25`) that may not be shut down or have PoE disabled. If this variable is unset, empty, or contains an invalid port, disable and PoE-off fail closed (every port is refused). Enabling a port is still allowed. |
@@ -69,7 +72,7 @@ Secrets stay in hub template variables. Write tools that can persist or
 widen device access (`save_config` and the SNMP tools) are gated by the
 hub `unlock` feature (0.12+); `maxMinutes: 0` means every call needs a
 fresh approval. Keep `SWITCH_SNMP_WRITE_ENABLED` unset (the tools refuse)
-until Redy has confirmed the CLI syntax; only then set it to `1` in the
+until the community-create syntax has been confirmed live; only then set it to `1` in the
 hub env (shown below as the value to use after that confirmation). Fill `SWITCH_PROTECTED_PORTS` after the first read test —
 until it is set to a valid list, disable and PoE-off are refused.
 
@@ -79,7 +82,7 @@ until it is set to a valid list, disable and PoE-off are refused.
     "command": "uvx",
     "args": [
       "--python", "3.12",
-      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.1.3",
+      "--from", "git+https://github.com/WackEarl/netmiko-mcp-linksys@v0.2.0",
       "netmiko-mcp-linksys"
     ],
     "env": {
@@ -133,7 +136,7 @@ Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 | `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back of `show interfaces description` for that port (verified, quoted, empty, probably truncated, or could not verify). | no |
 | `save_config()` | Privileged exec `save` only. Gate this in the hub with `unlock`. | yes |
 | `snmp_view_create(view_name, subtree)` | Add one **included** subtree from a fixed OID allowlist (`interfaces`, `ifmib`, `power-ethernet`) to a **read** view. Refused for a view that is used as a write view or holds a writable column or an excluded entry. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
-| `snmp_write_view_create(view_name, subtree)` | Add one writable column to a **write** view: `ifAdminStatus` (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) or `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`, PoE on/off). One `snmp view <view> <column> included` line, sent with a `%` error check and verified in `show snmp viewtree`; on failure it is removed again (see below). Whole MIB subtrees are never allowed. **No per-port exclusions:** the column is writable for every port, protected ports included. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_write_view_create(view_name, subtree)` | Add one writable column to a **write** view: `ifAdminStatus` (`1.3.6.1.2.1.2.2.1.7`), `ifAlias` (`1.3.6.1.2.1.31.1.1.1.18`) or `pethPsePortAdminEnable` (`1.3.6.1.2.1.105.1.1.1.3`, PoE on/off). One `snmp view <view> <column> included` line, sent with a `%` error check and verified in `show snmp viewtree`; on failure it is removed again (see below). Whole MIB subtrees are never allowed. **No per-port exclusions:** the column is writable for every port, protected ports included. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Create and viewtree read-back live-confirmed; rollback (`no snmp view`) is not.** | no |
 | `snmp_community_create(view_name, access, write_view=None)` | Create a v2c community from `SWITCH_SNMP_COMMUNITY` bound to an existing restricted read view (`view_name`). `ro`: write view `none`. `rw`: requires a separate `write_view` that passes the write-view check (only writable columns). The secret is never a tool argument. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 | `snmp_community_remove(name)` | Remove `public` or `private` only, and only after the configured community is verified present with a restricted view. Never removes the configured community. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 | `snmp_user_remove(name)` | Remove `noAuthUser` only. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
@@ -202,7 +205,7 @@ therefore:
 3. Gives up after `SWITCH_READ_TIMEOUT` seconds without new output. The error
    contains the last visible line, so an unknown pager prompt can be added.
 
-## SNMP tools (not live-confirmed)
+## SNMP tools
 
 These tools exist so Home Assistant can use a **non-default SNMPv2c
 community** that is read-write (or read-only) but restricted to IF-MIB,
@@ -210,9 +213,11 @@ and so the default `public` / `private` communities and the default v3
 user `noAuthUser` can be removed afterwards. They send only fixed
 command sequences; there is no generic SNMP configure tool.
 
-**Do not run the write tools against the live switch until Redy has
-verified the CLI syntax on the LGS328PC (firmware 1.01.02.02).**
-`SWITCH_SNMP_WRITE_ENABLED` must stay unset (or anything other than
+Creating a column in a write view (`snmp view <view> <column>
+included`) and reading it back from `show snmp viewtree` were confirmed
+in the 0.2.0 live check. **Community create/remove syntax and the SNMP
+read/write path through an external client are not live-confirmed.**
+`SWITCH_SNMP_WRITE_ENABLED` should stay unset (or anything other than
 `1`) until then; the tools fail closed. The
 command templates live in `src/netmiko_mcp_linksys/snmp_cli.py` and
 cite their source. The primary source is the official Linksys LGSXXX
@@ -327,11 +332,14 @@ Masks follow RFC 3415: bit *n* belongs to sub-identifier *n*, a missing
 or short mask is extended with ones, and bits beyond the OID length do
 not matter. A mask is exact when every bit that covers an arc of the OID
 is 1. Accepted spellings: empty / `none` / `-`, dotted bits (`1`,
-`1.1.1`) and hex octets (`ff`, `ff:e0`, `0xffe0`). So the full mask the
-switch prints (`Subtree Mask : 1` in Redy's read check) and a hex mask
-such as `ff:e0` for an 11-arc column are accepted, while a mask with a 0
-inside the OID (a wildcard, such as `ff:c0` for an 11-arc OID) is
-refused.
+`1.1.1`) and hex octets (`ff`, `ff:e0`, `0xffe0`). The 0.2.0 live check
+showed that after adding a column, the switch prints a mask with one `1`
+per arc (`Subtree Mask : 1.1.1.1.1.1.1.1.1.1.1` for
+`1.3.6.1.2.1.105.1.1.1.3`) and `Storage Type : Non-volatile` immediately.
+The earlier read-only check printed `Subtree Mask : 1` for OID `1`. A
+hex mask such as `ff:e0` for an 11-arc column is also accepted, while a
+mask with a 0 inside the OID (a wildcard, such as `ff:c0` for an 11-arc
+OID) is refused.
 
 The viewtree parser reads the layout from Redy's read-only check:
 
@@ -405,30 +413,40 @@ the switch then needs local access to recover. Therefore:
 
 ### Live-test checklist (Redy)
 
+Confirmed in the 0.2.0 live check (see [Live-test status](#live-test-status)):
+
+- Refused config lines print an error starting with `%` (`% Invalid
+  input detected at '^' marker`).
+- `show snmp view` is an alias of `show snmp viewtree`.
+- After `snmp_write_view_create`, `show snmp viewtree` prints the column
+  OID as given (no leading dot), a mask of one `1` per arc
+  (`1.1.1.1.1.1.1.1.1.1.1` for `1.3.6.1.2.1.105.1.1.1.3`), `View Type :
+  Included`, and `Storage Type : Non-volatile` immediately, without
+  `save_config`. The column is accepted without a mask in the create
+  command.
+
+Still unconfirmed:
+
 - Exact syntax: does `snmp community name … security …` work, or is the
-  ISS `index` form required? Is `notify none` / `write none` accepted?
-- Storage type of new view / group / community (volatile vs
-  nonvolatile) and whether `save_config` actually persists them.
+  ISS `index` form required? (The switch lists communities under a
+  Community Index, so the `index` form may be needed.) Is `notify none`
+  / `write none` accepted?
+- Storage type of a new group / community and whether `save_config`
+  actually persists them (new views are already Non-volatile).
 - Whether `enable snmpagent` is required first.
-- Exact `show snmp community`, `show snmp viewtree`, `show snmp group`,
-  `show snmp group access`, and `show snmp user` layouts (the parsers
-  assume ISS `Key: value` blocks separated by `-----`; `show snmp
-  viewtree` is confirmed read-only, see above).
+- Exact `show snmp community`, `show snmp group`, `show snmp group
+  access`, and `show snmp user` layouts (the parsers assume ISS
+  `Key: value` blocks separated by `-----`; `show snmp viewtree` is
+  confirmed, see above).
 - Exact spelling of the default communities and of `noAuthUser`.
-- `show snmp view` as an alias of `show snmp viewtree` (unconfirmed;
-  the manual only documents `viewtree`).
 - SET of `ifAlias` with the new view.
-- That refused config lines print an error starting with `%` (the
-  write-view tool stops on it), and that `no snmp view <view> <oid>`
-  removes exactly that entry (used for rollback).
-- How `show snmp viewtree` prints a column OID such as
-  `1.3.6.1.2.1.105.1.1.1.3` and its mask after
-  `snmp_write_view_create` (Redy's read check only showed OID `1` with
-  mask `1`); whether the column is accepted without a mask.
+- That `no snmp view <view> <oid>` removes exactly that entry (used
+  for rollback; not triggered in the 0.2.0 check).
 - That a GET/WALK of `1.3.6.1.2.1.105` works with the community and a
   SET of `pethPsePortAdminEnable` and `ifAdminStatus` works on a free
-  port (e.g. 0/18). If PoE SET fails, fall back to PoE read-only. Do
-  **not** SET 0/10 or 0/24: nothing at SNMP level stops it.
+  port (e.g. 0/18) through an external SNMP client. If PoE SET fails,
+  fall back to PoE read-only. Do **not** SET 0/10 or 0/24: nothing at
+  SNMP level stops it.
 - Confirm leftover `public` / `private` / `noAuthUser` are gone, and
   that the session log and tool output never contain the community.
 - Terminal width: `cisco_s300` `session_preparation` already sends
@@ -437,6 +455,31 @@ the switch then needs local access to recover. Therefore:
   not wrap mid-secret in a way that a later live check would miss.
 
 ## Live-test status
+
+Confirmed on LGS328PC, firmware 1.01.02.02, in the 0.2.0 live check
+(Redy, commit 177dc84, 2026-11-13):
+
+- Device error lines start with `%` (example: `% Invalid input
+  detected at '^' marker`).
+- `snmp view <view> <column> included` (no mask) is accepted for a
+  write-view column such as `1.3.6.1.2.1.105.1.1.1.3` or
+  `1.3.6.1.2.1.2.2.1.7`.
+- `show snmp viewtree` prints `Subtree OID  : 1.3.6.1.2.1.105.1.1.1.3`
+  / `Subtree Mask : 1.1.1.1.1.1.1.1.1.1.1` (one `1` per arc),
+  `View Type : Included`, `Storage Type : Non-volatile` immediately
+  (no `save_config`), `Row Status : Active`. `show snmp view` is an
+  alias of `viewtree`.
+- `port_set_admin_state` and `poe_set` (CLI, not SNMP) worked on a
+  free port (0/18) and were reversed.
+
+Not verified in that check:
+
+- The SNMP read/write path through an external client (GET/WALK of
+  `1.3.6.1.2.1.105`, SET of `pethPsePortAdminEnable` / `ifAdminStatus`
+  / `ifAlias`).
+- Community create/remove syntax (the switch lists communities under a
+  Community Index, so the ISS form with `index` may be required).
+- `no snmp view <view> <oid>` removing exactly one entry.
 
 Confirmed on LGS328PC, firmware 1.01.02.02 (0.1.0 and 0.1.1 live tests):
 

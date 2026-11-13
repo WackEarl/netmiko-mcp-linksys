@@ -1,6 +1,6 @@
 [project]
 name = "netmiko-mcp-linksys"
-version = "0.1.3"
+version = "0.2.0"
 description = "stdio MCP wrapper based on netmiko and netmiko-mcp for Linksys LGS-series switches"
 readme = "README.md"
 license = "MIT"
