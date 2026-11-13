@@ -1417,3 +1417,25 @@ def test_cody_redact_secrets_preserves_hash_and_gt_line_starts(
     else:
         monkeypatch.delenv("SWITCH_SNMP_COMMUNITY", raising=False)
     assert redact_secrets(sample) == sample
+
+
+
+def test_cody_show_snmp_community_listing_keeps_hash_and_gt_headers(
+    community_env: str,
+) -> None:
+    """A show-snmp-community echo must not strip '#-headers' or 'Status> ' lines."""
+    listing = (
+        "LGS328PC# show snmp community\n"
+        "No# Community Index: 1\n"
+        f"Community Name: {SECRET}\n"
+        "Status> active\n"
+        "Security Name: ifmib_sec\n"
+    )
+    out = redact_secrets(listing)
+    assert SECRET not in out
+    assert "No# Community Index: 1" in out
+    assert "Status> active" in out
+    assert "LGS328PC# show snmp community" in out
+    assert "Community Name: [REDACTED]" in out
+    # Only the secret was replaced; the rest of the listing is intact.
+    assert out == listing.replace(SECRET, "[REDACTED]")
