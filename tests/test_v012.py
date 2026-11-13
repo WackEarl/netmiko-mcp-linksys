@@ -160,14 +160,33 @@ def test_readback_truncated_description_is_ok() -> None:
     assert "expected" not in note
 
 
-def test_readback_short_prefix_ok_when_it_fills_column_width() -> None:
-    # No trailing padding: the parsed field runs to the end of the line.
-    header = ASSUMED_DESCRIPTION_HEADER
-    col = header.find("Description")
-    row = ("Gi0/7".ljust(col) + "Repeat")
-    table = header + "\n" + row
+def test_readback_short_prefix_is_not_ok_without_known_width() -> None:
+    table = "\n".join(
+        [
+            ASSUMED_DESCRIPTION_HEADER,
+            _desc_row("0/7", "up", "up", "Rep"),
+        ]
+    )
+    note = description_readback_note(table, "0/7", "Repeater EG")
+    assert "probably truncated" not in note
+    assert "expected" in note
+    assert "Rep" in note
+
+
+def test_readback_short_prefix_ok_when_it_equals_separator_width() -> None:
+    col = ASSUMED_DESCRIPTION_HEADER.find("Description")
+    # Three-character Description bar; parsed "Rep" fills that width.
+    separator = (" " * col) + "---"
+    table = "\n".join(
+        [
+            ASSUMED_DESCRIPTION_HEADER,
+            separator,
+            _desc_row("0/7", "up", "up", "Rep"),
+        ]
+    )
     note = description_readback_note(table, "0/7", "Repeater EG")
     assert "probably truncated by the switch table, ok" in note
+    assert "expected" not in note
 
 
 def test_short_port_form_does_not_match_three_level_row() -> None:

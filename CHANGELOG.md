@@ -27,9 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   descriptions on the LGS). Port rows `Gi0/7`, `gi7`, `gi1/0/7`, and
   `GigabitEthernet0/7` are recognised (and `0/1` does not match `0/10`).
   With a `Description`/`Name` header, the note compares the column
-  (whitespace collapsed); a non-empty prefix of the expected text that
-  fills the column or is at least 8 characters is reported as probably
-  truncated, not as a mismatch. Without a recognised header, a row that
+  (whitespace collapsed). A strict prefix is reported as probably
+  truncated only if it is at least 8 characters, or if a known column
+  width (next header column, or the Description bar on a separator
+  line) equals the parsed length; a stale short prefix such as `Rep`
+  is a mismatch. Without a recognised header, a row that
   ends with the expected text is verified; otherwise the note says
   `could not verify (unknown table layout)` and includes the raw row.
   A missing row is `could not verify (port row not found)` plus a short

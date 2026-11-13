@@ -280,12 +280,45 @@ def _ends_with_text(row: str, text: str) -> bool:
     return haystack == needle or haystack.endswith(" " + needle)
 
 
-def _is_truncated(parsed: str, expected: str, *, fills_width: bool) -> bool:
+def _is_truncated(
+    parsed: str, expected: str, *, column_width: int | None
+) -> bool:
     parsed_n = _collapse_ws(parsed)
     expected_n = _collapse_ws(expected)
     if not parsed_n or parsed_n == expected_n or not expected_n.startswith(parsed_n):
         return False
-    return fills_width or len(parsed_n) >= _MIN_TRUNCATION_PREFIX
+    if len(parsed_n) >= _MIN_TRUNCATION_PREFIX:
+        return True
+    return column_width is not None and len(parsed) == column_width
+
+
+def _is_separator(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and bool(re.fullmatch(r"[\s\-=]+", line)) and any(
+        char in stripped for char in "-="
+    )
+
+
+def _column_width_from_header(header: str, label_start: int, label_end: int) -> int | None:
+    next_token = re.search(r"\S", header[label_end:])
+    if next_token is None:
+        return None
+    width = (label_end + next_token.start()) - label_start
+    return width if width > 0 else None
+
+
+def _column_width_from_separator(line: str, header_col: int) -> int | None:
+    # A distinct dash/equals bar starting at the header column, not a
+    # single rule drawn across the whole table.
+    if header_col >= len(line) or line[header_col] not in "-=":
+        return None
+    if header_col > 0 and line[header_col - 1] in "-=":
+        return None
+    end = header_col
+    while end < len(line) and line[end] in "-=":
+        end += 1
+    width = end - header_col
+    return width if width > 0 else None
 
 
 def _output_preview(body: str) -> str:
@@ -298,7 +331,7 @@ class DescriptionRow:
     raw: str
     header_col: int | None
     parsed: str | None
-    fills_width: bool
+    column_width: int | None
 
 
 def find_description_row(
@@ -309,19 +342,32 @@ def find_description_row(
     The second item is a short preview of the table body, for notes when
     the row cannot be found.
     """
-    body = output.split(" ---\n", 1)[-1]
+    # run_config_and_readback wraps the table in a "--- <command> ---" line.
+    # Do not treat a separator bar that merely contains " ---" as that wrapper.
+    match = re.search(r"^--- .+ ---\n", output, re.MULTILINE)
+    body = output[match.end() :] if match else output
     preview = _output_preview(body)
     header_col: int | None = None
+    column_width: int | None = None
     for line in body.splitlines():
         raw = line.rstrip("\r")
         if not raw.strip():
             continue
-        if header_col is None and not _is_interface_row(raw):
-            match = re.search(r"\bDescription\b", raw, re.IGNORECASE) or re.search(
-                r"\bName\b", raw, re.IGNORECASE
-            )
-            if match:
-                header_col = match.start()
+        if not _is_interface_row(raw):
+            if header_col is None:
+                match = re.search(r"\bDescription\b", raw, re.IGNORECASE) or re.search(
+                    r"\bName\b", raw, re.IGNORECASE
+                )
+                if match:
+                    header_col = match.start()
+                    column_width = _column_width_from_header(
+                        raw, match.start(), match.end()
+                    )
+                    continue
+            elif _is_separator(raw):
+                sep_width = _column_width_from_separator(raw, header_col)
+                if sep_width is not None:
+                    column_width = sep_width
                 continue
         if _port_token_end(raw, port) is None:
             continue
@@ -332,7 +378,7 @@ def find_description_row(
                     raw=raw.rstrip(),
                     header_col=header_col,
                     parsed=field.strip(),
-                    fills_width=bool(field) and field == field.rstrip(),
+                    column_width=column_width,
                 ),
                 preview,
             )
@@ -341,7 +387,7 @@ def find_description_row(
                 raw=raw.rstrip(),
                 header_col=None,
                 parsed=None,
-                fills_width=False,
+                column_width=None,
             ),
             preview,
         )
@@ -368,8 +414,11 @@ def description_readback_note(readback: str, port: str, text: str | None) -> str
     without quotes. A quoted match means the quotes were stored literally.
     Comparisons collapse whitespace. Without a recognised header, a row
     that ends with the expected text is treated as verified; otherwise
-    the note says the layout could not be verified. A missing row is
-    never reported as a mismatch.
+    the note says the layout could not be verified. Truncation is
+    accepted only for a strict prefix of at least 8 characters, or when
+    a known column width (next header column or separator dash length)
+    equals the parsed length. A missing row is never reported as a
+    mismatch.
     """
     row, preview = find_description_row(readback, port)
     if row is None:
@@ -413,7 +462,7 @@ def description_readback_note(readback: str, port: str, text: str | None) -> str
         )
     if parsed_n == _collapse_ws(text):
         return "Read-back check: description found in read-back (without quotes)."
-    if _is_truncated(parsed, text, fills_width=row.fills_width):
+    if _is_truncated(parsed, text, column_width=row.column_width):
         return (
             "Read-back check: probably truncated by the switch table, ok "
             f"({parsed!r})."
