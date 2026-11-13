@@ -281,6 +281,76 @@ def parse_protected_ports(raw: str | None = None) -> set[str]:
     return ports
 
 
+SNMP_PROTECTED_IFINDEXES_ENV = "SWITCH_SNMP_PROTECTED_IFINDEXES"
+# ifIndex is an Integer32 in 1..2147483647; no leading zeros, no signs.
+_IFINDEX_RE = re.compile(r"^[1-9][0-9]{0,9}$")
+_IFINDEX_MAX = 2147483647
+_IFINDEX_HINT = (
+    "Set it to port=ifIndex pairs for every port in SWITCH_PROTECTED_PORTS, "
+    "e.g. 0/10=<ifIndex>,0/24=<ifIndex>, with ifIndex values verified live "
+    "(IF-MIB ifDescr / show interfaces). Refusing SNMP write access "
+    "(fail-closed)."
+)
+
+
+def parse_protected_ifindexes(raw: str | None = None) -> dict[str, str]:
+    """Return {port: ifIndex} for SWITCH_PROTECTED_PORTS, or raise (fail-closed).
+
+    The port-to-ifIndex mapping of the LGS328PC is not known, so it is
+    never derived from the port number. SWITCH_SNMP_PROTECTED_IFINDEXES
+    must list exactly the ports in SWITCH_PROTECTED_PORTS, each with an
+    explicit, unique ifIndex. Anything else (unset, empty, malformed,
+    duplicates, missing or extra ports) is a configuration error.
+    """
+    name = SNMP_PROTECTED_IFINDEXES_ENV
+    if raw is None:
+        if name not in os.environ:
+            raise ValidationError(f"{name} is not set. " + _IFINDEX_HINT)
+        raw = os.environ[name]
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        raise ValidationError(f"{name} is empty. " + _IFINDEX_HINT)
+    mapping: dict[str, str] = {}
+    for part in parts:
+        port, sep, ifindex = (item.strip() for item in part.partition("="))
+        if (
+            not sep
+            or not PORT_RE.fullmatch(port)
+            or not _IFINDEX_RE.fullmatch(ifindex)
+            or int(ifindex) > _IFINDEX_MAX
+        ):
+            raise ValidationError(
+                f"{name} has an invalid entry {part!r}. " + _IFINDEX_HINT
+            )
+        if port in mapping:
+            raise ValidationError(
+                f"{name} lists port {port} more than once. " + _IFINDEX_HINT
+            )
+        mapping[port] = ifindex
+    if len(set(mapping.values())) != len(mapping):
+        raise ValidationError(
+            f"{name} maps two ports to the same ifIndex. " + _IFINDEX_HINT
+        )
+    protected = parse_protected_ports()
+    missing = sorted(protected - mapping.keys())
+    extra = sorted(mapping.keys() - protected)
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing protected port(s) " + ", ".join(missing))
+        if extra:
+            details.append(
+                "port(s) not in SWITCH_PROTECTED_PORTS " + ", ".join(extra)
+            )
+        raise ValidationError(
+            f"{name} does not match SWITCH_PROTECTED_PORTS ("
+            + "; ".join(details)
+            + "). "
+            + _IFINDEX_HINT
+        )
+    return mapping
+
+
 def validate_port(port: str, *, poe: bool = False) -> str:
     if not isinstance(port, str) or not PORT_RE.fullmatch(port):
         raise ValidationError(

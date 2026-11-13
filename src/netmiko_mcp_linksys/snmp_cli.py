@@ -24,7 +24,9 @@ import re
 from dataclasses import dataclass
 
 from netmiko_mcp_linksys.validation import (
+    SNMP_PROTECTED_IFINDEXES_ENV,
     ValidationError,
+    parse_protected_ifindexes,
     redact_secrets,
     valid_community_for_redaction,
 )
@@ -71,6 +73,12 @@ from netmiko_mcp_linksys.validation import (
 # whether enable snmpagent is required, exact spelling of default
 # communities / the noAuthUser user, and whether POWER-ETHERNET-MIB
 # 1.3.6.1.2.1.105 is implemented on the LGS328PC.
+#
+# UNCONFIRMED: the LGS328PC port -> ifIndex mapping (hence the explicit
+# SWITCH_SNMP_PROTECTED_IFINDEXES), whether an instance OID such as
+# 1.3.6.1.2.1.2.2.1.7.<ifIndex> is accepted as an excluded subtree
+# without a mask, and how show snmp viewtree prints the view type and
+# the mask (the parser accepts only empty or all-ones masks).
 
 CLI_SOURCE = (
     "Linksys LGSXXX CLI User Manual, MAN_LGSXXX_LNKPG-00878_Rev_A00.pdf, "
@@ -108,6 +116,16 @@ OID_ALIASES: dict[str, str] = {
     "power-ethernet": "1.3.6.1.2.1.105",
     "power-ethernet-mib": "1.3.6.1.2.1.105",
 }
+
+POE_SUBTREE = "1.3.6.1.2.1.105"
+
+# Subtrees a *write* view may include. POWER-ETHERNET-MIB is read-only by
+# design: port 0/10 powers the Unraid server through a PoE splitter, so a
+# write view must never allow pethPsePortAdminEnable.
+WRITE_ALLOWED_SUBTREES = frozenset({"1.3.6.1.2.1.2", "1.3.6.1.2.1.31"})
+
+# IF-MIB ifTable ifAdminStatus column; .<ifIndex> selects one interface.
+IF_ADMIN_STATUS_OID = "1.3.6.1.2.1.2.2.1.7"
 
 # Views that cover the whole tree (or equally broad roots) are never
 # "expected" access for the new community.
@@ -178,18 +196,79 @@ def build_view_create_commands(view_name: str, oid: str) -> list[str]:
     return [f"snmp view {view_name} {oid} included"]
 
 
+def protected_admin_status_oids(ifindexes: dict[str, str]) -> list[str]:
+    """ifAdminStatus.<ifIndex> OIDs to exclude from every write view."""
+    return sorted(
+        (f"{IF_ADMIN_STATUS_OID}.{ifindex}" for ifindex in ifindexes.values()),
+        key=lambda oid: [int(part) for part in oid.split(".")],
+    )
+
+
+def normalize_write_subtree(subtree: str) -> str:
+    """Return an OID a write view may include, or raise ValidationError."""
+    oid = normalize_subtree(subtree)
+    if oid not in WRITE_ALLOWED_SUBTREES:
+        raise ValidationError(
+            f"subtree {oid} is not allowed in a write view. Write views may "
+            "include only " + ", ".join(sorted(WRITE_ALLOWED_SUBTREES)) + "; "
+            "POWER-ETHERNET-MIB stays read-only (0/10 powers the Unraid "
+            "server via a PoE splitter). Use snmp_view_create for the read view."
+        )
+    return oid
+
+
+def build_write_view_commands(
+    view_name: str, oid: str, excluded_oids: list[str]
+) -> list[str]:
+    """Linksys CLI: snmp view <ViewName> <OIDTree> {included | excluded}.
+
+    Exclusions are sent first so the view never includes ifTable without
+    the protected-port ifAdminStatus exclusions, even for a moment.
+    """
+    if not excluded_oids:
+        raise ValidationError(
+            "No ifAdminStatus exclusions configured. Refusing to build a "
+            "write view (fail-closed)."
+        )
+    return [f"snmp view {view_name} {item} excluded" for item in excluded_oids] + [
+        f"snmp view {view_name} {oid} included"
+    ]
+
+
 def build_community_create_commands(
-    view_name: str, access: str, community: str
+    view_name: str, access: str, community: str, write_view: str | None = None
 ) -> list[str]:
     """ISS v2c mapping: group + access + community (Linksys name/security form).
+
+    ``view_name`` is the read view. For ``rw`` a separate ``write_view``
+    is required (read/write split); for ``ro`` it must be omitted.
 
     The community string is used only as the ``name`` value and is never
     reused as the security/group name, so show snmp group does not repeat
     the secret. The caller must redact any echo of these commands.
     """
+    if access == "rw":
+        if not write_view:
+            raise ValidationError(
+                "rw access needs a separate write_view (created with "
+                "snmp_write_view_create). Refusing to grant write access "
+                "through the read view."
+            )
+        if write_view.lower() == view_name.lower():
+            raise ValidationError(
+                "write_view must differ from the read view (view_name). "
+                "The read view may include POWER-ETHERNET-MIB; the write "
+                "view must not."
+            )
+        write = write_view
+    else:
+        if write_view:
+            raise ValidationError(
+                "write_view is only valid with access 'rw'."
+            )
+        write = "none"
     group = group_name_for_view(view_name)
     security = security_name_for_view(view_name)
-    write = view_name if access == "rw" else "none"
     return [
         f"snmp group {group} user {security} security-model v2c",
         (
@@ -261,6 +340,7 @@ class ViewSubtree:
     oid: str
     view_type: str
     raw: str
+    mask: str = ""
 
 
 @dataclass(frozen=True)
@@ -318,10 +398,13 @@ def parse_snmp_viewtree(output: str) -> list[ViewSubtree]:
         name = _field(fields, "view name", "viewname")
         oid = _field(fields, "subtree oid", "subtreeoid", "oid tree", "oidtree", "subtree")
         view_type = _field(fields, "view type", "viewtype", "type").lower()
+        mask = _field(fields, "subtree mask", "subtreemask", "oid mask", "oidmask", "mask")
         if not name or not oid:
             continue
         entries.append(
-            ViewSubtree(name=name, oid=oid, view_type=view_type, raw=record)
+            ViewSubtree(
+                name=name, oid=oid, view_type=view_type, raw=record, mask=mask
+            )
         )
     return entries
 
@@ -420,6 +503,22 @@ def redact_community_listing(text: str, *, names: list[str] | None = None) -> st
     return redacted
 
 
+# Accepted spellings of an all-ones mask (exact subtree match, no
+# wildcard). RFC 3415: a missing or short mask is extended with ones. Any
+# other mask could wildcard sub-identifiers and is treated as unknown.
+_EXACT_MASK_RE = re.compile(
+    r"^(?:|-|none|n/a|1(?:\.1)*|(?:0x)?f+|ff(?:[:\s]ff)*)$", re.IGNORECASE
+)
+
+
+def mask_is_exact(mask: str) -> bool:
+    return bool(_EXACT_MASK_RE.fullmatch(mask.strip()))
+
+
+def compact_oid(oid: str) -> str:
+    return oid.strip().rstrip(".")
+
+
 def view_included_oids(entries: list[ViewSubtree], view_name: str) -> list[str]:
     oids: list[str] = []
     for entry in entries:
@@ -436,6 +535,12 @@ def view_is_restricted(entries: list[ViewSubtree], view_name: str) -> tuple[bool
     oids = view_included_oids(entries, view_name)
     if not oids:
         return False, f"view {view_name!r} has no included subtrees in the read-back"
+    for entry in entries:
+        if entry.name.lower() == view_name.lower() and not mask_is_exact(entry.mask):
+            return False, (
+                f"view {view_name!r} has subtree {entry.oid} with an "
+                "unrecognised mask (could be a wildcard)"
+            )
     for oid in oids:
         compact = oid.strip().rstrip(".")
         if compact in BROAD_OIDS:
@@ -452,6 +557,73 @@ def view_is_restricted(entries: list[ViewSubtree], view_name: str) -> tuple[bool
         f"view {view_name} includes only allow-listed subtrees: "
         + ", ".join(oids)
     )
+
+
+def view_is_write_safe(
+    entries: list[ViewSubtree], view_name: str, excluded_oids: list[str]
+) -> tuple[bool, str]:
+    """Strict check of a write view (fail-closed).
+
+    Every entry of the view must have an explicit included/excluded type
+    and an exact mask; included subtrees must be in WRITE_ALLOWED_SUBTREES
+    (never POWER-ETHERNET-MIB); every ifAdminStatus exclusion in
+    ``excluded_oids`` must be present as an excluded entry.
+    """
+    if not excluded_oids:
+        return False, (
+            f"no ifAdminStatus exclusions configured for write view {view_name!r}"
+        )
+    own = [entry for entry in entries if entry.name.lower() == view_name.lower()]
+    if not own:
+        return False, f"write view {view_name!r} was not found in the read-back"
+    included: list[str] = []
+    excluded: set[str] = set()
+    for entry in own:
+        oid = compact_oid(entry.oid)
+        if not mask_is_exact(entry.mask):
+            return False, (
+                f"write view {view_name!r} has subtree {oid} with an "
+                "unrecognised mask (could be a wildcard)"
+            )
+        if entry.view_type in {"included", "include"}:
+            included.append(oid)
+        elif entry.view_type in {"excluded", "exclude"}:
+            excluded.add(oid)
+        else:
+            return False, (
+                f"write view {view_name!r} has subtree {oid} without a "
+                "recognised included/excluded type"
+            )
+    if not included:
+        return False, f"write view {view_name!r} has no included subtrees"
+    for oid in included:
+        if oid == POE_SUBTREE:
+            return False, (
+                f"write view {view_name!r} includes POWER-ETHERNET-MIB {oid} "
+                "(PoE must stay read-only)"
+            )
+        if oid not in WRITE_ALLOWED_SUBTREES:
+            return False, (
+                f"write view {view_name!r} includes subtree {oid}, which is "
+                "not allowed in a write view"
+            )
+    missing = [oid for oid in excluded_oids if oid not in excluded]
+    if missing:
+        return False, (
+            f"write view {view_name!r} is missing the ifAdminStatus "
+            "exclusion(s) " + ", ".join(missing)
+        )
+    return True, (
+        f"write view {view_name} includes only "
+        + ", ".join(included)
+        + " and excludes "
+        + ", ".join(excluded_oids)
+    )
+
+
+def required_write_exclusions() -> list[str]:
+    """ifAdminStatus exclusions from SWITCH_SNMP_PROTECTED_IFINDEXES (or raise)."""
+    return protected_admin_status_oids(parse_protected_ifindexes())
 
 
 def _model_is_v2c(model: str) -> bool:
@@ -483,8 +655,16 @@ def assert_configured_community_ready(
     access_output: str,
     view_output: str,
     community: str,
+    expected_read_view: str | None = None,
+    expected_write_view: str | None = None,
 ) -> str:
     """Verify the configured community is present and view-restricted.
+
+    A write view (anything other than ``none``) must differ from the read
+    view and pass view_is_write_safe with the ifAdminStatus exclusions
+    from SWITCH_SNMP_PROTECTED_IFINDEXES. If expected views are given
+    (after a create), the access entries must name exactly those views;
+    ``expected_write_view=None`` then means the write view must be none.
 
     Raises ValidationError on failure. The secret never appears in the
     error text or the returned status.
@@ -549,6 +729,10 @@ def assert_configured_community_ready(
 
     views = parse_snmp_viewtree(view_output)
     notes: list[str] = []
+    if expected_read_view is not None:
+        _assert_expected_access_views(
+            matched_access, expected_read_view, expected_write_view
+        )
     for item in matched_access:
         if _view_is_none(item.read_view):
             raise ValidationError(
@@ -571,12 +755,25 @@ def assert_configured_community_ready(
                 "another community."
             )
         else:
-            ok, note = view_is_restricted(views, item.write_view)
+            if write.lower() == item.read_view.strip().lower():
+                raise ValidationError(
+                    "Configured community's access uses the same view for "
+                    "read and write (no read/write split). Refusing to "
+                    "remove another community."
+                )
+            try:
+                exclusions = required_write_exclusions()
+            except ValidationError as exc:
+                raise ValidationError(
+                    f"Configured community has write access, but "
+                    f"{SNMP_PROTECTED_IFINDEXES_ENV} is not usable: {exc}"
+                ) from None
+            ok, note = view_is_write_safe(views, write, exclusions)
             if not ok:
                 raise ValidationError(
-                    "write " + note + ". Refusing to remove another community."
+                    note[:1].upper() + note[1:] + ". Refusing to remove another community."
                 )
-            notes.append("write " + note)
+            notes.append(note)
     return (
         "Configured community is present, bound to group(s) "
         + ", ".join(sorted(group_names))
@@ -584,6 +781,26 @@ def assert_configured_community_ready(
         + "; ".join(notes)
         + "."
     )
+
+
+def _assert_expected_access_views(
+    matched_access: list[AccessEntry],
+    expected_read_view: str,
+    expected_write_view: str | None,
+) -> None:
+    """Exact comparison of the access entries against the requested views."""
+    want_write = expected_write_view if expected_write_view else "none"
+    for item in matched_access:
+        read = item.read_view.strip()
+        write = item.write_view.strip()
+        write_matches = (
+            write.lower() == "none" if want_write == "none" else write == want_write
+        )
+        if read != expected_read_view or not write_matches:
+            raise ValidationError(
+                "Configured community's access does not use the requested "
+                f"views (expected read {expected_read_view}, write {want_write})."
+            )
 
 
 def resolve_removable_community_name(

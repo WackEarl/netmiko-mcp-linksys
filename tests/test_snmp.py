@@ -22,22 +22,28 @@ from netmiko_mcp_linksys.snmp_cli import (
     build_community_remove_commands,
     build_user_remove_commands,
     build_view_create_commands,
+    build_write_view_commands,
     format_sent_commands,
     group_name_for_view,
+    mask_is_exact,
     normalize_subtree,
+    normalize_write_subtree,
     parse_snmp_access,
     parse_snmp_community,
     parse_snmp_group,
     parse_snmp_user,
     parse_snmp_viewtree,
+    protected_admin_status_oids,
     redact_community_listing,
     resolve_removable_community_name,
     security_name_for_view,
     user_present,
     view_is_restricted,
+    view_is_write_safe,
 )
 from netmiko_mcp_linksys.validation import (
     ValidationError,
+    parse_protected_ifindexes,
     redact_secrets,
     validate_community_remove_name,
     validate_snmp_access,
@@ -93,6 +99,27 @@ Subtree Mask:
 View Type: included
 Storage Type: nonVolatile
 Row Status: active
+------------------------------
+View Name: ifmib_w
+Subtree OID: 1.3.6.1.2.1.2
+Subtree Mask:
+View Type: included
+Storage Type: nonVolatile
+Row Status: active
+------------------------------
+View Name: ifmib_w
+Subtree OID: 1.3.6.1.2.1.2.2.1.7.124
+Subtree Mask:
+View Type: excluded
+Storage Type: nonVolatile
+Row Status: active
+------------------------------
+View Name: ifmib_w
+Subtree OID: 1.3.6.1.2.1.2.2.1.7.125
+Subtree Mask:
+View Type: excluded
+Storage Type: nonVolatile
+Row Status: active
 """
 
 VIEW_SHOW_WITH_POE = VIEW_SHOW_RESTRICTED + """
@@ -122,7 +149,7 @@ ACCESS_SHOW_RW = """
 Group Name: ifmib_grp
 Security Model: v2c
 Read View: ifmib
-Write View: ifmib
+Write View: ifmib_w
 Notify View: none
 Storage Type: nonVolatile
 Row Status: active
@@ -154,6 +181,17 @@ Privacy Protocol        : None
 @pytest.fixture(autouse=True)
 def enable_snmp_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SWITCH_SNMP_WRITE_ENABLED", "1")
+
+
+# Dummy ifIndex values for the conftest SWITCH_PROTECTED_PORTS (0/24,0/25).
+# Deliberately not the port numbers: the real mapping is verified live.
+IFINDEX_ENV = "0/24=124,0/25=125"
+EXCLUDED_OIDS = ["1.3.6.1.2.1.2.2.1.7.124", "1.3.6.1.2.1.2.2.1.7.125"]
+
+
+@pytest.fixture(autouse=True)
+def protected_ifindexes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", IFINDEX_ENV)
 
 
 @pytest.fixture
@@ -273,9 +311,9 @@ def test_normalize_subtree_allowlist() -> None:
 def test_command_builders_and_redacted_listing(community_env: str) -> None:
     view_cmds = build_view_create_commands("ifmib", "1.3.6.1.2.1.2")
     assert view_cmds == ["snmp view ifmib 1.3.6.1.2.1.2 included"]
-    cmds = build_community_create_commands("ifmib", "rw", SECRET)
+    cmds = build_community_create_commands("ifmib", "rw", SECRET, "ifmib_w")
     assert cmds[0] == "snmp group ifmib_grp user ifmib_sec security-model v2c"
-    assert cmds[1] == "snmp access ifmib_grp v2c read ifmib write ifmib notify none"
+    assert cmds[1] == "snmp access ifmib_grp v2c read ifmib write ifmib_w notify none"
     assert cmds[2] == f"snmp community name {SECRET} security ifmib_sec"
     # Security name is derived, not the secret.
     assert security_name_for_view("ifmib") == "ifmib_sec"
@@ -395,7 +433,7 @@ def test_parsers_read_iss_blocks() -> None:
     assert groups[0].user == "ifmib_sec"
     access = parse_snmp_access(ACCESS_SHOW_RW)
     assert access[0].read_view == "ifmib"
-    assert access[0].write_view == "ifmib"
+    assert access[0].write_view == "ifmib_w"
     users = parse_snmp_user(USER_SHOW)
     assert user_present(USER_SHOW, "noAuthUser")
     assert not user_present(USER_SHOW, "admin")
@@ -447,7 +485,7 @@ Security Name: none
 
 
 def test_refuse_remove_when_write_view_is_iso(community_env: str) -> None:
-    with pytest.raises(ValidationError, match="broad subtree") as exc:
+    with pytest.raises(ValidationError, match="not allowed in a write view") as exc:
         assert_configured_community_ready(
             community_output=COMMUNITY_SHOW,
             group_output=GROUP_SHOW,
@@ -485,18 +523,37 @@ Security Name: ifmib_sec
         resolve_removable_community_name(SECRET, entries, SECRET)
 
 
+def _fake_snmp_session(
+    shows: dict[str, str] | Any, sent_log: list[list[str]]
+) -> Any:
+    """run_in_session stand-in: canned show output, records config sets."""
+
+    def exec_cmd(_conn: Any, command: str) -> str:
+        return shows(command) if callable(shows) else shows[command]
+
+    def send(_conn: Any, commands: list[str]) -> str:
+        sent_log.append(list(commands))
+        return "ok"
+
+    def fake_session(callback: Any, **_kwargs: Any) -> str:
+        with (
+            patch("netmiko_mcp_linksys.server._snmp_exec", side_effect=exec_cmd),
+            patch("netmiko_mcp_linksys.server._send_config", side_effect=send),
+        ):
+            return callback(object())
+
+    return fake_session
+
+
 def test_snmp_view_create_tool() -> None:
     from netmiko_mcp_linksys.server import snmp_view_create
 
-    with patch(
-        "netmiko_mcp_linksys.server.run_config_and_readbacks",
-        return_value="Configuration sent.\n--- show snmp viewtree ---\n" + VIEW_SHOW_RESTRICTED,
-    ) as run:
+    sent: list[list[str]] = []
+    session = _fake_snmp_session({READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED}, sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
         result = snmp_view_create("ifmib", "interfaces")
-    run.assert_called_once()
-    commands, readbacks = run.call_args.args
-    assert commands == ["snmp view ifmib 1.3.6.1.2.1.2 included"]
-    assert readbacks == [READBACK_SNMP_VIEW]
+    assert sent == [["snmp view ifmib 1.3.6.1.2.1.2 included"]]
+    assert "--- show snmp viewtree ---" in result
     assert "Read-back check: view ifmib includes 1.3.6.1.2.1.2" in result
     assert "Not live-confirmed" in result or "not live-confirmed" in result.lower()
 
@@ -504,7 +561,7 @@ def test_snmp_view_create_tool() -> None:
 def test_snmp_view_create_rejects_bad_oid() -> None:
     from netmiko_mcp_linksys.server import snmp_view_create
 
-    with patch("netmiko_mcp_linksys.server.run_config_and_readbacks") as run:
+    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
         result = snmp_view_create("ifmib", "1.3.6.1.2.1.1")
     run.assert_not_called()
     assert result.startswith("Rejected:")
@@ -539,7 +596,7 @@ def test_snmp_community_create_and_redaction(community_env: str) -> None:
         return result
 
     with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=fake_session):
-        result = snmp_community_create("ifmib", "rw")
+        result = snmp_community_create("ifmib", "rw", "ifmib_w")
     assert SECRET not in result
     assert "[REDACTED]" in result
     assert "snmp community name [REDACTED] security ifmib_sec" in result
@@ -1065,7 +1122,13 @@ def test_cody_snmp_tools_disable_session_log(
         patch.object(connection, "send_paged", fake_paged),
         patch.object(server, "send_paged", fake_paged),
     ):
-        server.snmp_community_create("ifmib", "rw")
+        server.snmp_community_create("ifmib", "rw", "ifmib_w")
+        assert captured, "the tool must reach the connection layer"
+        assert "session_log" not in captured
+        captured.clear()
+        server.snmp_write_view_create("ifmib_w", "interfaces")
+        server.snmp_view_create("ifmib", "power-ethernet")
+    assert captured, "the tool must reach the connection layer"
     assert "session_log" not in captured
     assert not log.exists() or log.read_text(encoding="utf-8") == ""
 
@@ -1101,20 +1164,18 @@ def test_cody_write_tools_require_enable_flag(
         snmp_community_remove,
         snmp_user_remove,
         snmp_view_create,
+        snmp_write_view_create,
     )
 
     monkeypatch.delenv("SWITCH_SNMP_WRITE_ENABLED", raising=False)
-    with (
-        patch("netmiko_mcp_linksys.server.run_in_session") as run,
-        patch("netmiko_mcp_linksys.server.run_config_and_readbacks") as run_rb,
-    ):
+    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
         view = snmp_view_create("ifmib", "interfaces")
-        create = snmp_community_create("ifmib", "rw")
+        write_view = snmp_write_view_create("ifmib_w", "interfaces")
+        create = snmp_community_create("ifmib", "rw", "ifmib_w")
         remove = snmp_community_remove("public")
         user = snmp_user_remove("noAuthUser")
     run.assert_not_called()
-    run_rb.assert_not_called()
-    for result in (view, create, remove, user):
+    for result in (view, write_view, create, remove, user):
         assert result.startswith("Rejected:")
         assert "SWITCH_SNMP_WRITE_ENABLED" in result
         assert SECRET not in result
@@ -1439,3 +1500,546 @@ def test_cody_show_snmp_community_listing_keeps_hash_and_gt_headers(
     assert "Community Name: [REDACTED]" in out
     # Only the secret was replaced; the rest of the listing is intact.
     assert out == listing.replace(SECRET, "[REDACTED]")
+
+
+# ---------------------------------------------------------------------------
+# Write-view hardening (Redy): ifAdminStatus exclusions for protected ports,
+# POWER-ETHERNET-MIB only in the read view, separate read/write views.
+# ---------------------------------------------------------------------------
+
+def _view_block(name: str, oid: str, view_type: str, mask: str = "") -> str:
+    return (
+        f"View Name: {name}\nSubtree OID: {oid}\nSubtree Mask: {mask}\n"
+        f"View Type: {view_type}\nStorage Type: nonVolatile\nRow Status: active\n"
+    )
+
+
+def _views(*blocks: str) -> str:
+    return "------------------------------\n".join(blocks)
+
+
+WRITE_VIEW_OK = _views(
+    _view_block("ifmib_w", "1.3.6.1.2.1.2", "included"),
+    _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
+    _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
+)
+
+
+def test_ifindex_env_valid_mapping() -> None:
+    assert parse_protected_ifindexes() == {"0/24": "124", "0/25": "125"}
+    assert parse_protected_ifindexes(" 0/25 = 125 , 0/24=124 ") == {
+        "0/25": "125",
+        "0/24": "124",
+    }
+    assert protected_admin_status_oids({"0/24": "124", "0/25": "9"}) == [
+        "1.3.6.1.2.1.2.2.1.7.9",
+        "1.3.6.1.2.1.2.2.1.7.124",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("", "is empty"),
+        (" , ", "is empty"),
+        ("0/24,0/25=125", "invalid entry"),
+        ("0/24=0,0/25=125", "invalid entry"),
+        ("0/24=0124,0/25=125", "invalid entry"),
+        ("0/24=-1,0/25=125", "invalid entry"),
+        ("0/24=abc,0/25=125", "invalid entry"),
+        ("0/24=2147483648,0/25=125", "invalid entry"),
+        ("0/24=1.2,0/25=125", "invalid entry"),
+        ("0/99=1,0/25=125", "invalid entry"),
+        ("0/24=124,0/24=125", "more than once"),
+        ("0/24=124,0/25=124", "same ifIndex"),
+        ("0/24=124", "missing protected port(s) 0/25"),
+        ("0/24=124,0/25=125,0/10=110", "not in SWITCH_PROTECTED_PORTS 0/10"),
+    ],
+)
+def test_ifindex_env_rejects_bad_values(raw: str, message: str) -> None:
+    with pytest.raises(ValidationError, match=__import__("re").escape(message)):
+        parse_protected_ifindexes(raw)
+
+
+def test_ifindex_env_unset_or_protected_ports_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_IFINDEXES is not set"):
+        parse_protected_ifindexes()
+    monkeypatch.setenv("SWITCH_SNMP_PROTECTED_IFINDEXES", IFINDEX_ENV)
+    monkeypatch.delenv("SWITCH_PROTECTED_PORTS")
+    with pytest.raises(ValidationError, match="SWITCH_PROTECTED_PORTS is not set"):
+        parse_protected_ifindexes()
+
+
+def test_write_view_commands_send_exclusions_first() -> None:
+    cmds = build_write_view_commands("ifmib_w", "1.3.6.1.2.1.2", EXCLUDED_OIDS)
+    assert cmds == [
+        "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.124 excluded",
+        "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.125 excluded",
+        "snmp view ifmib_w 1.3.6.1.2.1.2 included",
+    ]
+    with pytest.raises(ValidationError, match="No ifAdminStatus exclusions"):
+        build_write_view_commands("ifmib_w", "1.3.6.1.2.1.2", [])
+
+
+def test_poe_is_never_a_write_subtree() -> None:
+    assert normalize_write_subtree("interfaces") == "1.3.6.1.2.1.2"
+    assert normalize_write_subtree("1.3.6.1.2.1.31") == "1.3.6.1.2.1.31"
+    for poe in ("power-ethernet", "POWER-ETHERNET-MIB", "1.3.6.1.2.1.105"):
+        with pytest.raises(ValidationError, match="not allowed in a write view"):
+            normalize_write_subtree(poe)
+    with pytest.raises(ValidationError, match="allowlist"):
+        normalize_write_subtree("1.3.6.1.2.1.2.2.1.7")
+
+
+def test_community_commands_require_split_views() -> None:
+    with pytest.raises(ValidationError, match="separate write_view"):
+        build_community_create_commands("ifmib", "rw", SECRET)
+    with pytest.raises(ValidationError, match="must differ"):
+        build_community_create_commands("ifmib", "rw", SECRET, "IFMIB")
+    with pytest.raises(ValidationError, match="only valid with access 'rw'"):
+        build_community_create_commands("ifmib", "ro", SECRET, "ifmib_w")
+    cmds = build_community_create_commands("ifmib", "rw", SECRET, "ifmib_w")
+    assert cmds[1] == "snmp access ifmib_grp v2c read ifmib write ifmib_w notify none"
+
+
+def test_mask_is_exact() -> None:
+    for mask in ("", " ", "-", "none", "1", "1.1.1.1", "ff", "FF:FF", "0xff", "ff ff"):
+        assert mask_is_exact(mask), mask
+    for mask in ("0", "1.0.1", "fe", "7f", "ff:00", "1.1.0", "?"):
+        assert not mask_is_exact(mask), mask
+
+
+def test_view_is_write_safe_accepts_complete_write_view() -> None:
+    ok, note = view_is_write_safe(
+        parse_snmp_viewtree(WRITE_VIEW_OK), "ifmib_w", EXCLUDED_OIDS
+    )
+    assert ok, note
+    assert "excludes 1.3.6.1.2.1.2.2.1.7.124, 1.3.6.1.2.1.2.2.1.7.125" in note
+
+
+@pytest.mark.parametrize(
+    ("listing", "message"),
+    [
+        (
+            _views(
+                _view_block("ifmib_w", "1.3.6.1.2.1.2", "included"),
+                _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
+            ),
+            "missing the ifAdminStatus exclusion(s) 1.3.6.1.2.1.2.2.1.7.125",
+        ),
+        (
+            WRITE_VIEW_OK + "------------------------------\n"
+            + _view_block("ifmib_w", "1.3.6.1.2.1.105", "included"),
+            "POWER-ETHERNET-MIB",
+        ),
+        (
+            WRITE_VIEW_OK + "------------------------------\n"
+            + _view_block("ifmib_w", "1", "included"),
+            "not allowed in a write view",
+        ),
+        (
+            _views(
+                _view_block("ifmib_w", "1.3.6.1.2.1.2", "included"),
+                _view_block("ifmib_w", EXCLUDED_OIDS[0], ""),
+                _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
+            ),
+            "included/excluded type",
+        ),
+        (
+            _views(
+                _view_block("ifmib_w", "1.3.6.1.2.1.2", "included"),
+                _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded", mask="ff:ff:00"),
+                _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
+            ),
+            "unrecognised mask",
+        ),
+        (
+            # Exclusions written as "included" do not count.
+            _views(
+                _view_block("ifmib_w", "1.3.6.1.2.1.2", "included"),
+                _view_block("ifmib_w", EXCLUDED_OIDS[0], "included"),
+                _view_block("ifmib_w", EXCLUDED_OIDS[1], "included"),
+            ),
+            "not allowed in a write view",
+        ),
+        (
+            _views(
+                _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
+                _view_block("ifmib_w", EXCLUDED_OIDS[1], "excluded"),
+            ),
+            "no included subtrees",
+        ),
+        (VIEW_SHOW_RESTRICTED.replace("ifmib_w", "other"), "was not found"),
+    ],
+)
+def test_view_is_write_safe_rejects(listing: str, message: str) -> None:
+    ok, note = view_is_write_safe(parse_snmp_viewtree(listing), "ifmib_w", EXCLUDED_OIDS)
+    assert not ok
+    assert message in note
+
+
+def test_view_is_write_safe_without_exclusions_refuses() -> None:
+    ok, note = view_is_write_safe(parse_snmp_viewtree(WRITE_VIEW_OK), "ifmib_w", [])
+    assert not ok
+    assert "no ifAdminStatus exclusions configured" in note
+
+
+def test_read_view_with_wildcard_mask_is_not_restricted() -> None:
+    listing = _view_block("ifmib", "1.3.6.1.2.1.2", "included", mask="ff:00")
+    ok, note = view_is_restricted(parse_snmp_viewtree(listing), "ifmib")
+    assert not ok
+    assert "unrecognised mask" in note
+
+
+def _ready(access: str, views: str, **kwargs: Any) -> str:
+    return assert_configured_community_ready(
+        community_output=COMMUNITY_SHOW,
+        group_output=GROUP_SHOW,
+        access_output=access,
+        view_output=views,
+        community=SECRET,
+        **kwargs,
+    )
+
+
+def test_ready_verifies_split_and_exclusions(community_env: str) -> None:
+    status = _ready(
+        ACCESS_SHOW_RW,
+        VIEW_SHOW_WITH_POE,
+        expected_read_view="ifmib",
+        expected_write_view="ifmib_w",
+    )
+    assert "read view ifmib includes only allow-listed subtrees" in status
+    assert "1.3.6.1.2.1.105" in status  # PoE in the read view is fine
+    assert "write view ifmib_w includes only 1.3.6.1.2.1.2" in status
+    assert "excludes 1.3.6.1.2.1.2.2.1.7.124" in status
+    assert SECRET not in status
+
+
+def test_ready_refuses_rw_without_ifindex_env(
+    community_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+    with pytest.raises(ValidationError, match="SWITCH_SNMP_PROTECTED_IFINDEXES") as exc:
+        _ready(ACCESS_SHOW_RW, VIEW_SHOW_RESTRICTED)
+    assert SECRET not in str(exc.value)
+
+
+def test_ready_ro_community_does_not_need_ifindex_env(
+    community_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+    ro = ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: none")
+    status = _ready(ro, VIEW_SHOW_RESTRICTED, expected_read_view="ifmib")
+    assert "read-only" in status
+
+
+def test_ready_refuses_same_read_and_write_view(community_env: str) -> None:
+    same = ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: IFMIB")
+    with pytest.raises(ValidationError, match="same view for read and write"):
+        _ready(same, VIEW_SHOW_RESTRICTED)
+
+
+def test_ready_refuses_write_view_with_poe(community_env: str) -> None:
+    poe = VIEW_SHOW_RESTRICTED + "------------------------------\n" + _view_block(
+        "ifmib_w", "1.3.6.1.2.1.105", "included"
+    )
+    with pytest.raises(ValidationError, match="POWER-ETHERNET-MIB"):
+        _ready(ACCESS_SHOW_RW, poe)
+
+
+def test_ready_refuses_write_view_missing_exclusion(community_env: str) -> None:
+    missing = VIEW_SHOW_RESTRICTED.replace(
+        "Subtree OID: 1.3.6.1.2.1.2.2.1.7.125", "Subtree OID: 1.3.6.1.2.1.2.2.1.7.126"
+    )
+    with pytest.raises(ValidationError, match=r"missing the ifAdminStatus exclusion"):
+        _ready(ACCESS_SHOW_RW, missing)
+
+
+def test_ready_expected_views_are_exact(community_env: str) -> None:
+    with pytest.raises(ValidationError, match="does not use the requested views"):
+        _ready(
+            ACCESS_SHOW_RW,
+            VIEW_SHOW_RESTRICTED,
+            expected_read_view="ifmib",
+            expected_write_view="other_w",
+        )
+    with pytest.raises(ValidationError, match="does not use the requested views"):
+        _ready(ACCESS_SHOW_RW, VIEW_SHOW_RESTRICTED, expected_read_view="ifmib")
+    with pytest.raises(ValidationError, match="does not use the requested views"):
+        _ready(
+            ACCESS_SHOW_RW,
+            VIEW_SHOW_RESTRICTED,
+            expected_read_view="IFMIB",
+            expected_write_view="ifmib_w",
+        )
+
+
+def _rw_listing(new_view: str) -> dict[str, str]:
+    return {
+        READBACK_SNMP_VIEW: new_view,
+        READBACK_SNMP_COMMUNITY: COMMUNITY_SHOW,
+        READBACK_SNMP_GROUP: GROUP_SHOW,
+        READBACK_SNMP_ACCESS: ACCESS_SHOW_RW,
+    }
+
+
+def test_snmp_write_view_create_happy_path(community_env: str, audit_log) -> None:
+    from netmiko_mcp_linksys.server import snmp_write_view_create
+
+    sent: list[list[str]] = []
+    session = _fake_snmp_session({READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED}, sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_write_view_create("ifmib_w", "interfaces")
+    assert sent == [
+        [
+            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.124 excluded",
+            "snmp view ifmib_w 1.3.6.1.2.1.2.2.1.7.125 excluded",
+            "snmp view ifmib_w 1.3.6.1.2.1.2 included",
+        ]
+    ]
+    assert "Read-back check: write view ifmib_w includes only 1.3.6.1.2.1.2" in result
+    assert not _secret_in(result, SECRET)
+    assert not _secret_in(audit_log.read_text(encoding="utf-8"), SECRET)
+
+
+@pytest.mark.parametrize("subtree", ["power-ethernet", "1.3.6.1.2.1.105"])
+def test_snmp_write_view_create_refuses_poe(subtree: str) -> None:
+    from netmiko_mcp_linksys.server import snmp_write_view_create
+
+    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
+        result = snmp_write_view_create("ifmib_w", subtree)
+    run.assert_not_called()
+    assert result.startswith("Rejected:")
+    assert "not allowed in a write view" in result
+
+
+def test_snmp_write_view_create_refuses_without_ifindexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_write_view_create
+
+    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
+        result = snmp_write_view_create("ifmib_w", "interfaces")
+    run.assert_not_called()
+    assert result.startswith("Rejected:")
+    assert "SWITCH_SNMP_PROTECTED_IFINDEXES is not set" in result
+
+
+@pytest.mark.parametrize(
+    ("listing", "message"),
+    [
+        (VIEW_SHOW_WITH_POE, "already includes 1.3.6.1.2.1.105"),
+        ("garbage without keys", "Could not parse show snmp viewtree"),
+    ],
+)
+def test_snmp_write_view_create_prechecks_before_send(listing: str, message: str) -> None:
+    from netmiko_mcp_linksys.server import snmp_write_view_create
+
+    sent: list[list[str]] = []
+    session = _fake_snmp_session({READBACK_SNMP_VIEW: listing}, sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        # "ifmib" holds PoE in VIEW_SHOW_WITH_POE, so it cannot become a write view.
+        result = snmp_write_view_create("ifmib", "interfaces")
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert message in result
+
+
+def test_snmp_write_view_create_verification_failed_after_send(community_env: str) -> None:
+    from netmiko_mcp_linksys.server import snmp_write_view_create
+
+    calls: list[str] = []
+    incomplete = _views(
+        _view_block("ifmib_w", "1.3.6.1.2.1.2", "included"),
+        _view_block("ifmib_w", EXCLUDED_OIDS[0], "excluded"),
+    )
+
+    def shows(command: str) -> str:
+        calls.append(command)
+        # Before: no ifmib_w yet. After: the device dropped one exclusion.
+        return VIEW_SHOW_WITH_POE if len(calls) == 1 else incomplete
+
+    sent: list[list[str]] = []
+    with patch(
+        "netmiko_mcp_linksys.server.run_in_session",
+        side_effect=_fake_snmp_session(shows, sent),
+    ):
+        result = snmp_write_view_create("ifmib_w", "interfaces")
+    assert len(sent) == 1
+    assert result.startswith("Error: Configuration was sent, verification failed:")
+    assert "1.3.6.1.2.1.2.2.1.7.125" in result
+    assert SECRET not in result
+
+
+def test_snmp_view_create_poe_allowed_on_read_view() -> None:
+    from netmiko_mcp_linksys.server import snmp_view_create
+
+    sent: list[list[str]] = []
+    session = _fake_snmp_session(
+        {READBACK_SNMP_ACCESS: ACCESS_SHOW_RW, READBACK_SNMP_VIEW: VIEW_SHOW_WITH_POE},
+        sent,
+    )
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_view_create("ifmib", "power-ethernet")
+    assert sent == [["snmp view ifmib 1.3.6.1.2.1.105 included"]]
+    assert "Read-back check: view ifmib includes 1.3.6.1.2.1.105" in result
+
+
+@pytest.mark.parametrize(
+    ("view", "access", "message"),
+    [
+        ("ifmib_w", ACCESS_SHOW_RW, "is used as a write view"),
+        ("IFMIB_W", ACCESS_SHOW_RW, "is used as a write view"),
+        (
+            # Not bound yet, but it carries ifAdminStatus exclusions.
+            "ifmib_w",
+            ACCESS_SHOW_RW.replace("Write View: ifmib_w", "Write View: none"),
+            "has ifAdminStatus exclusions",
+        ),
+        ("ifmib", "garbage without keys", "Could not parse show snmp group access"),
+    ],
+)
+def test_snmp_view_create_refuses_poe_in_write_view(
+    view: str, access: str, message: str
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_view_create
+
+    sent: list[list[str]] = []
+    session = _fake_snmp_session(
+        {READBACK_SNMP_ACCESS: access, READBACK_SNMP_VIEW: VIEW_SHOW_RESTRICTED}, sent
+    )
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_view_create(view, "power-ethernet")
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert message in result
+
+
+def test_snmp_community_create_rw_split_and_redaction(
+    community_env: str, audit_log
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_community_create
+
+    sent: list[list[str]] = []
+    session = _fake_snmp_session(_rw_listing(VIEW_SHOW_WITH_POE), sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_community_create("ifmib", "rw", "ifmib_w")
+    assert len(sent) == 1
+    assert sent[0][1] == "snmp access ifmib_grp v2c read ifmib write ifmib_w notify none"
+    assert sent[0][2] == f"snmp community name {SECRET} security ifmib_sec"
+    assert not _secret_in(result, SECRET)
+    assert "snmp community name [REDACTED] security ifmib_sec" in result
+    assert "excludes 1.3.6.1.2.1.2.2.1.7.124" in result
+    assert not _secret_in(audit_log.read_text(encoding="utf-8"), SECRET)
+
+
+def test_snmp_community_create_rw_refuses_without_ifindexes(
+    community_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_community_create
+
+    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
+        result = snmp_community_create("ifmib", "rw", "ifmib_w")
+    run.assert_not_called()
+    assert result.startswith("Rejected:")
+    assert "SWITCH_SNMP_PROTECTED_IFINDEXES is not set" in result
+    assert SECRET not in result
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (("ifmib", "rw"), "separate write_view"),
+        (("ifmib", "rw", "ifmib"), "must differ"),
+        (("ifmib", "ro", "ifmib_w"), "only valid with access 'rw'"),
+        (("ifmib", "rw", "bad name"), "Invalid SNMP write view name"),
+    ],
+)
+def test_snmp_community_create_rejects_bad_view_args(
+    community_env: str, args: tuple[str, ...], message: str
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_community_create
+
+    with patch("netmiko_mcp_linksys.server.run_in_session") as run:
+        result = snmp_community_create(*args)
+    run.assert_not_called()
+    assert result.startswith("Rejected:")
+    assert message in result
+    assert SECRET not in result
+
+
+@pytest.mark.parametrize(
+    ("listing", "message"),
+    [
+        (
+            VIEW_SHOW_RESTRICTED.replace(
+                "Subtree OID: 1.3.6.1.2.1.2.2.1.7.124", "Subtree OID: 1.3.6.1.2.1.2.2.1.7.24"
+            ),
+            "missing the ifAdminStatus exclusion(s) 1.3.6.1.2.1.2.2.1.7.124",
+        ),
+        (
+            VIEW_SHOW_RESTRICTED + "------------------------------\n"
+            + _view_block("ifmib_w", "1.3.6.1.2.1.105", "included"),
+            "POWER-ETHERNET-MIB",
+        ),
+        (VIEW_SHOW_RESTRICTED.replace("ifmib_w", "zzz"), "was not found"),
+    ],
+)
+def test_snmp_community_create_rw_prechecks_write_view(
+    community_env: str, listing: str, message: str
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_community_create
+
+    sent: list[list[str]] = []
+    session = _fake_snmp_session(_rw_listing(listing), sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_community_create("ifmib", "rw", "ifmib_w")
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert message in result
+    assert "snmp_write_view_create" in result
+    assert SECRET not in result
+
+
+def test_snmp_community_create_rw_access_mismatch_is_verification_failed(
+    community_env: str,
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_community_create
+
+    listing = _rw_listing(VIEW_SHOW_RESTRICTED)
+    # The device bound the community with write none instead of ifmib_w.
+    listing[READBACK_SNMP_ACCESS] = ACCESS_SHOW_RW.replace(
+        "Write View: ifmib_w", "Write View: none"
+    )
+    sent: list[list[str]] = []
+    with patch(
+        "netmiko_mcp_linksys.server.run_in_session",
+        side_effect=_fake_snmp_session(listing, sent),
+    ):
+        result = snmp_community_create("ifmib", "rw", "ifmib_w")
+    assert len(sent) == 1
+    assert result.startswith("Error: Configuration was sent, verification failed:")
+    assert "does not use the requested views" in result
+    assert SECRET not in result
+
+
+def test_snmp_community_remove_refuses_rw_without_ifindexes(
+    community_env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from netmiko_mcp_linksys.server import snmp_community_remove
+
+    monkeypatch.delenv("SWITCH_SNMP_PROTECTED_IFINDEXES")
+    sent: list[list[str]] = []
+    session = _fake_snmp_session(_rw_listing(VIEW_SHOW_RESTRICTED), sent)
+    with patch("netmiko_mcp_linksys.server.run_in_session", side_effect=session):
+        result = snmp_community_remove("public")
+    assert sent == []
+    assert result.startswith("Rejected:")
+    assert "SWITCH_SNMP_PROTECTED_IFINDEXES" in result
+    assert SECRET not in result

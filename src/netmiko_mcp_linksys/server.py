@@ -29,7 +29,6 @@ from netmiko_mcp_linksys.connection import (
     read_timeout,
     redact_show_output,
     run_config_and_readback,
-    run_config_and_readbacks,
     run_in_session,
     run_save,
     run_show,
@@ -41,23 +40,34 @@ from netmiko_mcp_linksys.connection import (
 )
 from netmiko_mcp_linksys.snmp_cli import (
     CLI_SOURCE,
+    IF_ADMIN_STATUS_OID,
+    POE_SUBTREE,
     READBACK_SNMP_ACCESS,
     READBACK_SNMP_COMMUNITY,
     READBACK_SNMP_GROUP,
     READBACK_SNMP_USER,
     READBACK_SNMP_VIEW,
+    WRITE_ALLOWED_SUBTREES,
+    ViewSubtree,
     assert_configured_community_ready,
     build_community_create_commands,
     build_community_remove_commands,
     build_user_remove_commands,
     build_view_create_commands,
+    build_write_view_commands,
+    compact_oid,
     format_sent_commands,
     normalize_subtree,
+    normalize_write_subtree,
+    parse_snmp_access,
     parse_snmp_community,
     parse_snmp_viewtree,
+    required_write_exclusions,
     resolve_removable_community_name,
     user_present,
+    view_included_oids,
     view_is_restricted,
+    view_is_write_safe,
 )
 from netmiko_mcp_linksys.validation import (
     ValidationError,
@@ -86,8 +96,9 @@ mcp = MCPServer(
         "netmiko and netmiko-mcp. Use show for allow-listed read commands. "
         "Configuration tools build fixed CLI sequences; they do not accept "
         "free-form config. There are no VLAN, reboot, or reset tools. "
-        "SNMP write tools (snmp_view_create, snmp_community_create, "
-        "snmp_community_remove, snmp_user_remove) are narrow and must be "
+        "SNMP write tools (snmp_view_create, snmp_write_view_create, "
+        "snmp_community_create, snmp_community_remove, snmp_user_remove) "
+        "are narrow and must be "
         "gated by hub unlock, like save_config. The community secret comes "
         "only from SWITCH_SNMP_COMMUNITY and is redacted as [REDACTED]. "
         "Changes are not saved until save_config is called."
@@ -570,13 +581,46 @@ def _verification_failed(exc: BaseException) -> SwitchConnectionError:
     )
 
 
+def _precheck_poe_read_view(conn: Any, view_name: str) -> None:
+    """Refuse POWER-ETHERNET-MIB in a view that is (or looks like) a write view."""
+    accesses = parse_snmp_access(_snmp_exec(conn, READBACK_SNMP_ACCESS))
+    if not accesses:
+        raise ValidationError(
+            "Could not parse show snmp group access (unknown table layout). "
+            "Refusing to add POWER-ETHERNET-MIB until it is verified that "
+            "the view is not used for write access."
+        )
+    if any(item.write_view.strip().lower() == view_name.lower() for item in accesses):
+        raise ValidationError(
+            f"View {view_name!r} is used as a write view. POWER-ETHERNET-MIB "
+            "may only be added to a read view."
+        )
+    views = parse_snmp_viewtree(_snmp_exec(conn, READBACK_SNMP_VIEW))
+    if not views:
+        raise ValidationError(
+            "Could not parse show snmp viewtree (unknown table layout). "
+            "Refusing to add POWER-ETHERNET-MIB until the view is verified."
+        )
+    if any(
+        item.name.lower() == view_name.lower()
+        and item.oid.strip().startswith(IF_ADMIN_STATUS_OID + ".")
+        for item in views
+    ):
+        raise ValidationError(
+            f"View {view_name!r} has ifAdminStatus exclusions, so it is a "
+            "write view. POWER-ETHERNET-MIB may only be added to a read view."
+        )
+
+
 @mcp.tool()
 def snmp_view_create(view_name: str, subtree: str) -> str:
-    """Add one allow-listed included subtree to an SNMP view. Does not save.
+    """Add one allow-listed included subtree to an SNMP read view. Does not save.
 
     Gate this in the hub with unlock. subtree must be an OID or alias from
-    the fixed allowlist (interfaces / ifmib / power-ethernet). The CLI
-    syntax is not live-confirmed; see the README.
+    the fixed allowlist (interfaces / ifmib / power-ethernet). PoE is
+    refused for any view used as a write view; build write views with
+    snmp_write_view_create. The CLI syntax is not live-confirmed; see the
+    README.
     """
     params = {"view_name": view_name, "subtree": subtree}
     try:
@@ -584,43 +628,131 @@ def snmp_view_create(view_name: str, subtree: str) -> str:
         view_name = validate_snmp_name(view_name, what="view name")
         oid = normalize_subtree(subtree)
         commands = build_view_create_commands(view_name, oid)
-        output = run_config_and_readbacks(
-            commands,
-            [READBACK_SNMP_VIEW],
-            enable_session_log=False,
-        )
-        views = parse_snmp_viewtree(output)
-        present = any(
-            item.name.lower() == view_name.lower() and item.oid == oid
-            for item in views
-        )
-        if present:
-            note = (
-                f"Read-back check: view {view_name} includes {oid}."
+
+        def _run(conn: Any) -> str:
+            if oid == POE_SUBTREE:
+                _precheck_poe_read_view(conn, view_name)
+            _send_config(conn, commands)
+            try:
+                view_out = _snmp_exec(conn, READBACK_SNMP_VIEW)
+            except Exception as exc:  # noqa: BLE001 — must wrap any post-send failure
+                raise _verification_failed(exc) from None
+            present = any(
+                item.name.lower() == view_name.lower() and item.oid == oid
+                for item in parse_snmp_viewtree(view_out)
             )
-        else:
-            note = (
-                f"Read-back check: could not verify that view {view_name} "
-                f"includes {oid}. Confirm show snmp viewtree live; the "
-                "parser assumes ISS key: value blocks."
+            if present:
+                note = f"Read-back check: view {view_name} includes {oid}."
+            else:
+                note = (
+                    f"Read-back check: could not verify that view {view_name} "
+                    f"includes {oid}. Confirm show snmp viewtree live; the "
+                    "parser assumes ISS key: value blocks."
+                )
+            return (
+                format_sent_commands(commands)
+                + "\n\nConfiguration sent.\n"
+                + f"--- {READBACK_SNMP_VIEW} ---\n"
+                + redact_show_output(READBACK_SNMP_VIEW, view_out)
+                + "\n\n"
+                + note
+                + "\n"
+                + _snmp_syntax_note()
             )
-        body = (
-            format_sent_commands(commands)
-            + "\n\n"
-            + output
-            + "\n\n"
-            + note
-            + "\n"
-            + _snmp_syntax_note()
-        )
+
+        body = run_in_session(_run, enable_session_log=False)
     except ValidationError as exc:
         return _snmp_fail("snmp_view_create", params, exc, allowed=False)
     except SwitchConnectionError as exc:
         return _snmp_fail("snmp_view_create", params, exc, allowed=True)
-    return _ok("snmp_view_create", params, body)
+    return _ok("snmp_view_create", params, redact_secrets(body))
 
 
-def _precheck_view_for_community(conn: Any, view_name: str) -> None:
+@mcp.tool()
+def snmp_write_view_create(view_name: str, subtree: str) -> str:
+    """Add an IF-MIB subtree to an SNMP write view, with port exclusions. Does not save.
+
+    Gate this in the hub with unlock. subtree must be interfaces
+    (1.3.6.1.2.1.2) or ifmib (1.3.6.1.2.1.31); POWER-ETHERNET-MIB is
+    never allowed in a write view. Every call also sends
+    ``snmp view <view> 1.3.6.1.2.1.2.2.1.7.<ifIndex> excluded`` for each
+    port in SWITCH_SNMP_PROTECTED_IFINDEXES (required, fail-closed). The
+    CLI syntax and the ifIndex mapping are not live-confirmed.
+    """
+    params = {"view_name": view_name, "subtree": subtree}
+    try:
+        require_snmp_write_enabled()
+        view_name = validate_snmp_name(view_name, what="view name")
+        oid = normalize_write_subtree(subtree)
+        exclusions = required_write_exclusions()
+        commands = build_write_view_commands(view_name, oid, exclusions)
+
+        def _run(conn: Any) -> str:
+            before = parse_snmp_viewtree(_snmp_exec(conn, READBACK_SNMP_VIEW))
+            if not before:
+                raise ValidationError(
+                    "Could not parse show snmp viewtree (unknown table layout). "
+                    "Refusing to build a write view until the read-back can "
+                    "be verified. Confirm the output format live."
+                )
+            _precheck_write_view_target(before, view_name)
+            _send_config(conn, commands)
+            try:
+                view_out = _snmp_exec(conn, READBACK_SNMP_VIEW)
+                after = parse_snmp_viewtree(view_out)
+                ok, note = view_is_write_safe(after, view_name, exclusions)
+                if not ok:
+                    raise ValidationError(note)
+                included = {
+                    compact_oid(item) for item in view_included_oids(after, view_name)
+                }
+                if oid not in included:
+                    raise ValidationError(
+                        f"write view {view_name!r} does not include {oid}"
+                    )
+                return (
+                    format_sent_commands(commands)
+                    + "\n\nConfiguration sent.\n"
+                    + f"--- {READBACK_SNMP_VIEW} ---\n"
+                    + redact_show_output(READBACK_SNMP_VIEW, view_out)
+                    + "\n\nRead-back check: "
+                    + note
+                    + ".\n"
+                    + _snmp_syntax_note()
+                )
+            except Exception as exc:  # noqa: BLE001 — must wrap any post-send failure
+                raise _verification_failed(exc) from None
+
+        body = run_in_session(_run, enable_session_log=False)
+    except ValidationError as exc:
+        return _snmp_fail("snmp_write_view_create", params, exc, allowed=False)
+    except SwitchConnectionError as exc:
+        return _snmp_fail("snmp_write_view_create", params, exc, allowed=True)
+    return _ok("snmp_write_view_create", params, redact_secrets(body))
+
+
+def _precheck_write_view_target(views: list[ViewSubtree], view_name: str) -> None:
+    """Refuse to turn a view with non-write subtrees (e.g. PoE) into a write view."""
+    for item in views:
+        if item.name.lower() != view_name.lower():
+            continue
+        if item.view_type in {"excluded", "exclude"}:
+            continue
+        compact = compact_oid(item.oid)
+        if compact not in WRITE_ALLOWED_SUBTREES:
+            raise ValidationError(
+                f"View {view_name!r} already includes {compact}, which is "
+                "not allowed in a write view. Use a separate view name for "
+                "the write view."
+            )
+
+
+def _precheck_view_for_community(
+    conn: Any,
+    view_name: str,
+    write_view: str | None = None,
+    exclusions: list[str] | None = None,
+) -> None:
     views_text = _snmp_exec(conn, READBACK_SNMP_VIEW)
     views = parse_snmp_viewtree(views_text)
     if not views:
@@ -641,26 +773,51 @@ def _precheck_view_for_community(conn: Any, view_name: str) -> None:
             note + ". Refusing to bind a community to a view that is not "
             "restricted to the OID allowlist."
         )
+    if write_view is None:
+        return
+    ok, note = view_is_write_safe(views, write_view, exclusions or [])
+    if not ok:
+        raise ValidationError(
+            note[:1].upper()
+            + note[1:]
+            + ". Refusing to grant write access. Build the write view with "
+            "snmp_write_view_create first."
+        )
 
 
 @mcp.tool()
-def snmp_community_create(view_name: str, access: str) -> str:
-    """Create a v2c community from SWITCH_SNMP_COMMUNITY, bound to a view.
+def snmp_community_create(
+    view_name: str, access: str, write_view: str | None = None
+) -> str:
+    """Create a v2c community from SWITCH_SNMP_COMMUNITY, bound to views.
 
-    access is 'ro' or 'rw'. The secret is never a tool argument and is
-    redacted as [REDACTED] in all output. Does not save. Gate with hub unlock.
-    The CLI syntax is not live-confirmed; see the README.
+    view_name is the read view. access is 'ro' or 'rw'; 'rw' requires a
+    separate write_view built with snmp_write_view_create (no PoE, with
+    the SWITCH_SNMP_PROTECTED_IFINDEXES exclusions). The secret is never
+    a tool argument and is redacted as [REDACTED] in all output. Does not
+    save. Gate with hub unlock. The CLI syntax is not live-confirmed; see
+    the README.
     """
-    params = {"view_name": view_name, "access": access}
+    params = {"view_name": view_name, "access": access, "write_view": write_view}
     try:
         require_snmp_write_enabled()
         view_name = validate_snmp_name(view_name, what="view name")
         access = validate_snmp_access(access)
+        if write_view is not None:
+            write_view = validate_snmp_name(write_view, what="write view name")
         community = validate_snmp_community_secret()
-        commands = build_community_create_commands(view_name, access, community)
+        exclusions = required_write_exclusions() if access == "rw" else None
+        commands = build_community_create_commands(
+            view_name, access, community, write_view
+        )
 
         def _run(conn: Any) -> str:
-            _precheck_view_for_community(conn, view_name)
+            _precheck_view_for_community(
+                conn,
+                view_name,
+                write_view if access == "rw" else None,
+                exclusions,
+            )
             _send_config(conn, commands)
             try:
                 community_out = _snmp_exec(conn, READBACK_SNMP_COMMUNITY)
@@ -673,6 +830,8 @@ def snmp_community_create(view_name: str, access: str) -> str:
                     access_output=access_out,
                     view_output=view_out,
                     community=community,
+                    expected_read_view=view_name,
+                    expected_write_view=write_view if access == "rw" else None,
                 )
                 return (
                     format_sent_commands(commands)

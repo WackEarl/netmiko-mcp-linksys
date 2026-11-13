@@ -21,8 +21,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disable the session log for the call, and redact community echoes
   (including wrapped lines and `re.escape`/`repr` variants). The community
   charset is `[A-Za-z0-9_]`, length 8–32.
+- `snmp_write_view_create(view_name, subtree)` builds a separate write
+  view: only IF-MIB `1.3.6.1.2.1.2` / `1.3.6.1.2.1.31`, never
+  POWER-ETHERNET-MIB, and always `snmp view <view>
+  1.3.6.1.2.1.2.2.1.7.<ifIndex> excluded` (ifAdminStatus) for each
+  protected port, sent before the included subtree.
+- `SWITCH_SNMP_PROTECTED_IFINDEXES` (`port=ifIndex,…`): explicit ifIndex
+  values for exactly the ports in `SWITCH_PROTECTED_PORTS`. The ifIndex
+  is never derived from the port number; without a valid mapping every
+  write-view and RW operation refuses (fail-closed).
 
 ### Changed
+
+- `snmp_community_create(view_name, access, write_view=None)`: `rw` now
+  requires a separate `write_view` (`snmp access … read <ReadView> write
+  <WriteView> notify none`); the same view for read and write is refused,
+  and `ro` refuses a `write_view`. The write view is checked strictly
+  before sending, and after sending the access entry must name exactly
+  the requested views.
+- The `show snmp viewtree` read-back now verifies write views strictly
+  (explicit included/excluded type, all-ones or empty mask, only
+  write-allowed subtrees, every ifAdminStatus exclusion present, no
+  PoE) in `snmp_community_create` and `snmp_community_remove`. Read and
+  write views with an unrecognised (possibly wildcard) mask are refused.
+- `snmp_view_create` refuses `power-ethernet` for a view that is used as a
+  write view or carries ifAdminStatus exclusions, and now runs in a
+  single session with the "Configuration was sent, verification failed"
+  wrapper for post-send read-back errors.
 
 - SNMP community rejection paths return only a generic message (no device
   text). ANSI and prompt redraws are stripped only inside
