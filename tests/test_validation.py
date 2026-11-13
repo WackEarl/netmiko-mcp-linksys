@@ -5,6 +5,7 @@ import pytest
 from netmiko_mcp_linksys.server import show
 from netmiko_mcp_linksys.validation import (
     ValidationError,
+    config_output_is_error,
     parse_protected_ports,
     reject_if_protected,
     reject_unsafe_show_command,
@@ -50,7 +51,7 @@ def test_protected_ports_block_disable_only(monkeypatch: pytest.MonkeyPatch) -> 
     reject_if_protected("0/1", disabling=True, action="poe_set(enabled=False)")
 
 
-@pytest.mark.parametrize("text", ["Uplink", "nas 1", "port_A-01", "x" * 32])
+@pytest.mark.parametrize("text", ["Uplink", "nas 1", "port_A-01", "Error LED", "Invalid Port", "x" * 32])
 def test_valid_descriptions(text: str) -> None:
     assert validate_description(text) == text
 
@@ -158,3 +159,48 @@ def test_reject_unsafe_show_command_direct() -> None:
     with pytest.raises(ValidationError, match="not allowed"):
         reject_unsafe_show_command("show system information\nreload")
     assert reject_unsafe_show_command("show system information") == "show system information"
+
+
+def _config_echo(description: str) -> str:
+    return (
+        "configure terminal\r\n"
+        "LGS328PC(config)# interface gigabitethernet 0/7\r\n"
+        f'LGS328PC(config-if)# description "{description}"\r\n'
+        "LGS328PC(config-if)# end\r\n"
+        "LGS328PC#"
+    )
+
+
+@pytest.mark.parametrize("description", ["Error LED", "Invalid Port"])
+def test_config_output_ignores_error_words_in_echoed_description(description: str) -> None:
+    assert config_output_is_error(_config_echo(description)) is False
+    assert config_output_is_error(f'description "{description}"') is False
+
+
+def test_config_output_detects_iss_percent_error() -> None:
+    raw = (
+        "interface gigabitethernet 0/7\r\n"
+        'description "foo bar"\r\n'
+        "                 ^\r\n"
+        "% Invalid input detected at '^' marker.\r\n"
+        "LGS328PC(config-if)#"
+    )
+    assert config_output_is_error(raw) is True
+    assert config_output_is_error("% Invalid input detected") is True
+    assert config_output_is_error("  % Invalid input detected at '^' marker.  ") is True
+
+
+def test_config_output_percent_error_still_wins_with_error_description() -> None:
+    mixed = (
+        _config_echo("Error LED")
+        + "\r\n% Invalid input detected at '^' marker.\r\n"
+        + "LGS328PC#"
+    )
+    assert config_output_is_error(mixed) is True
+
+
+def test_config_output_ignores_error_words_without_percent() -> None:
+    assert config_output_is_error("Error") is False
+    assert config_output_is_error("Invalid input") is False
+    assert config_output_is_error("") is False
+    assert config_output_is_error("LGS328PC#") is False

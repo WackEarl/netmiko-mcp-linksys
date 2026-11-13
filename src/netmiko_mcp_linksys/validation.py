@@ -109,13 +109,19 @@ def reject_if_protected(port: str, *, disabling: bool, action: str) -> None:
 
 
 def config_output_is_error(output: str) -> bool:
-    """Heuristic: treat %, Invalid, or Error in device output as failure."""
+    """Treat ISS/IOS-style error lines (starting with '%') as failure.
+
+    Prompt lines and echoed command lines are ignored, so a description
+    such as "Error LED" or "Invalid Port" is not treated as a rejection.
+    Only stripped lines that start with '%' count (the LGS/ISS format is
+    "% Invalid input detected at '^' marker.").
+    """
     if not output:
         return False
     for line in output.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.startswith("%") or "Invalid" in stripped or "Error" in stripped:
+        if stripped.startswith("%"):
             return True
     return False

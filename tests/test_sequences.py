@@ -124,6 +124,31 @@ def test_run_config_rejects_device_error(monkeypatch: pytest.MonkeyPatch) -> Non
     conn.write_channel.assert_not_called()
 
 
+@pytest.mark.parametrize("description", ["Error LED", "Invalid Port"])
+def test_run_config_accepts_echoed_error_or_invalid_description(
+    monkeypatch: pytest.MonkeyPatch, description: str
+) -> None:
+    monkeypatch.setenv("SWITCH_PAGING_OFF", "0")
+    conn = MagicMock()
+    conn.send_config_set.return_value = (
+        "configure terminal\r\n"
+        "LGS328PC(config)# interface gigabitethernet 0/7\r\n"
+        f'LGS328PC(config-if)# description "{description}"\r\n'
+        "LGS328PC(config-if)# end\r\n"
+        "LGS328PC#"
+    )
+    commands = build_description_commands("0/7", description)
+    readback = READBACK_INTERFACE.format(port="0/7")
+    with (
+        patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn),
+        patch("netmiko_mcp_linksys.connection.send_paged", return_value="STATE"),
+    ):
+        result = run_config_and_readback(commands, readback)
+    assert "STATE" in result
+    conn.send_config_set.assert_called_once()
+    assert conn.send_config_set.call_args.args[0] == commands
+
+
 def test_run_save_sends_only_save(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SWITCH_PAGING_OFF", "0")
     conn = MagicMock()
