@@ -50,7 +50,8 @@ package is installed in that environment.
 | `SWITCH_HOST` | yes (at tool call) | Switch IP or hostname. |
 | `SWITCH_USER` | yes (at tool call) | SSH username. |
 | `SWITCH_PASSWORD` | yes (at tool call) | SSH password. Never logged or returned. |
-| `SWITCH_SNMP_COMMUNITY` | yes before `snmp_community_create` / `snmp_community_remove` | SNMPv2c community string for the new, non-default community. Never a tool argument, never logged or returned (shown as `[REDACTED]`). Must not be `public` or `private`; 8–64 characters from `[A-Za-z0-9._-]`. |
+| `SWITCH_SNMP_COMMUNITY` | yes before `snmp_community_create` / `snmp_community_remove` | SNMPv2c community string for the new, non-default community. Never a tool argument, never logged or returned (shown as `[REDACTED]`). Must not be `public` or `private`; 8–32 characters from `[A-Za-z0-9_]` (no dots or dashes). An invalid value is not used for redaction. |
+| `SWITCH_SNMP_WRITE_ENABLED` | yes (`1`) before any SNMP write tool | Hard gate, **off by default**. SNMP write tools refuse unless this is exactly `1`. Leave it unset until Redy has confirmed the CLI syntax live. |
 | `SWITCH_DEVICE_TYPE` | no | netmiko device type. Default: `cisco_s300`. |
 | `SWITCH_KNOWN_HOSTS` | yes (at tool call) | Path to an OpenSSH `known_hosts` file with the switch host key. System host keys are not used. |
 | `SWITCH_PROTECTED_PORTS` | yes before any disable / PoE-off | Comma-separated ports (e.g. `0/24,0/25`) that may not be shut down or have PoE disabled. If this variable is unset, empty, or contains an invalid port, disable and PoE-off fail closed (every port is refused). Enabling a port is still allowed. |
@@ -67,7 +68,9 @@ Python 3.12 or newer is required.
 Secrets stay in hub template variables. Write tools that can persist or
 widen device access (`save_config` and the SNMP tools) are gated by the
 hub `unlock` feature (0.12+); `maxMinutes: 0` means every call needs a
-fresh approval. Fill `SWITCH_PROTECTED_PORTS` after the first read test —
+fresh approval. Keep `SWITCH_SNMP_WRITE_ENABLED` unset (the tools refuse)
+until Redy has confirmed the CLI syntax; only then set it to `1` in the
+hub env (shown below as the value to use after that confirmation). Fill `SWITCH_PROTECTED_PORTS` after the first read test —
 until it is set to a valid list, disable and PoE-off are refused.
 
 ```json
@@ -84,6 +87,7 @@ until it is set to a valid list, disable and PoE-off are refused.
       "SWITCH_USER": "${SWITCH_USER}",
       "SWITCH_PASSWORD": "${SWITCH_PASSWORD}",
       "SWITCH_SNMP_COMMUNITY": "${SWITCH_SNMP_COMMUNITY}",
+      "SWITCH_SNMP_WRITE_ENABLED": "1",
       "SWITCH_DEVICE_TYPE": "cisco_s300",
       "SWITCH_KNOWN_HOSTS": "/config/netmiko/known_hosts",
       "SWITCH_PROTECTED_PORTS": "<uplink and management ports, e.g. 0/24>",
@@ -127,10 +131,10 @@ Copy `examples/commands.yml` to `NETMIKO_MCP_COMMAND_FILE`. Create
 | `poe_set(port, enabled)` | `interface gigabitethernet 0/N` then `power inline enable` / `power inline disable`. PoE ports: `0/1`–`0/24`. | no |
 | `port_set_description(port, text?)` | `description "<text>"` (always quoted, the LGS CLI takes only one word unquoted) or `no description` when `text` is omitted. The result ends with an informational read-back of `show interfaces description` for that port (verified, quoted, empty, probably truncated, or could not verify). | no |
 | `save_config()` | Privileged exec `save` only. Gate this in the hub with `unlock`. | yes |
-| `snmp_view_create(view_name, subtree)` | Add one **included** subtree from a fixed OID allowlist to a view. Gate with hub `unlock`. **Not live-confirmed.** | no |
-| `snmp_community_create(view_name, access)` | Create a v2c community from `SWITCH_SNMP_COMMUNITY` (`ro` or `rw`) bound to an existing restricted view. The secret is never a tool argument. Gate with hub `unlock`. **Not live-confirmed.** | no |
-| `snmp_community_remove(name)` | Remove `public` or `private` only, and only after the configured community is verified present with a restricted view. Never removes the configured community. Gate with hub `unlock`. **Not live-confirmed.** | no |
-| `snmp_user_remove(name)` | Remove `noAuthUser` only. Gate with hub `unlock`. **Not live-confirmed.** | no |
+| `snmp_view_create(view_name, subtree)` | Add one **included** subtree from a fixed OID allowlist to a view. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_community_create(view_name, access)` | Create a v2c community from `SWITCH_SNMP_COMMUNITY` (`ro` or `rw`) bound to an existing restricted view. The secret is never a tool argument. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_community_remove(name)` | Remove `public` or `private` only, and only after the configured community is verified present with a restricted view. Never removes the configured community. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
+| `snmp_user_remove(name)` | Remove `noAuthUser` only. Gate with hub `unlock` and `SWITCH_SNMP_WRITE_ENABLED=1`. **Not live-confirmed.** | no |
 
 There are no VLAN, reboot, or reset tools.
 
@@ -205,7 +209,9 @@ user `noAuthUser` can be removed afterwards. They send only fixed
 command sequences; there is no generic SNMP configure tool.
 
 **Do not run the write tools against the live switch until Redy has
-verified the CLI syntax on the LGS328PC (firmware 1.01.02.02).** The
+verified the CLI syntax on the LGS328PC (firmware 1.01.02.02).**
+`SWITCH_SNMP_WRITE_ENABLED` must stay unset (or anything other than
+`1`) until then; the tools fail closed. The
 command templates live in `src/netmiko_mcp_linksys/snmp_cli.py` and
 cite their source. The primary source is the official Linksys LGSXXX
 CLI User Manual, chapter 19
@@ -233,11 +239,15 @@ flag. The tools use the Linksys form **without** `index` and without
 that flag. If the device rejects a command, stop and confirm the ISS
 variant live; do not guess.
 
-The community string is **only** read from `SWITCH_SNMP_COMMUNITY`. It is
-never a tool argument, is not reused as the group or security name
-(those are derived as `<view>_grp` / `<view>_sec`), and is replaced with
-`[REDACTED]` in tool output, audit entries, exceptions, and (after the
-session closes) the netmiko session log. `show snmp community` output is
+The community string is **only** read from `SWITCH_SNMP_COMMUNITY` (8–32
+characters from `[A-Za-z0-9_]`, not `public`/`private`). It is never a
+tool argument and is not reused as the group or security name (those are
+derived as `<view>_grp` / `<view>_sec`). It is replaced with `[REDACTED]`
+in tool output, audit entries, and exceptions, including `re.escape`/`repr`
+forms and a wrapped `snmp community name … security` span. An invalid env
+value is not used for redaction (and is warned at startup). SNMP write
+tools disable the netmiko session log for that session so a community
+echo cannot sit in the log in the clear. `show snmp community` output is
 redacted even when it is run through the `show` tool. Validation
 failures never echo the secret.
 
