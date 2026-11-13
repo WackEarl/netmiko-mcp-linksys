@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -134,21 +134,25 @@ def test_enable_allowed_when_protected_ports_unset(monkeypatch: pytest.MonkeyPat
 def test_port_overview_is_read_only(reset_command_file: None, monkeypatch: pytest.MonkeyPatch) -> None:
     from netmiko_mcp_linksys.server import PORT_OVERVIEW_COMMANDS
 
-    seen: list[str] = []
+    seen: list[list[str]] = []
 
-    def fake_show(command: str) -> str:
-        seen.append(command)
-        return f"OUT:{command}"
+    def fake_sequence(commands: list[str]) -> list[tuple[str, str | None, str | None]]:
+        seen.append(list(commands))
+        return [(command, f"OUT:{command}", None) for command in commands]
 
     with (
-        patch("netmiko_mcp_linksys.server.run_show", side_effect=fake_show) as run_show,
+        patch("netmiko_mcp_linksys.server.run_show", create=True) as run_show,
+        patch(
+            "netmiko_mcp_linksys.server.run_show_sequence", side_effect=fake_sequence
+        ) as run_seq,
         patch("netmiko_mcp_linksys.server.run_config_and_readback") as run_cfg,
         patch("netmiko_mcp_linksys.server.run_save") as run_save,
         patch("netmiko_mcp_linksys.server.run_config_set", create=True) as run_set,
     ):
         result = port_overview()
-    assert seen == list(PORT_OVERVIEW_COMMANDS)
-    run_show.assert_called()
+    assert seen == [list(PORT_OVERVIEW_COMMANDS)]
+    run_seq.assert_called_once()
+    run_show.assert_not_called()
     run_cfg.assert_not_called()
     run_save.assert_not_called()
     run_set.assert_not_called()
@@ -158,9 +162,113 @@ def test_port_overview_is_read_only(reset_command_file: None, monkeypatch: pytes
     assert not result.startswith("Error:")
 
 
+def test_port_overview_opens_one_session(
+    reset_command_file: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for #5: one SSH session for all four show commands."""
+    from netmiko_mcp_linksys.server import PORT_OVERVIEW_COMMANDS
+
+    monkeypatch.setenv("SWITCH_PAGING_OFF", "0")
+    conn = MagicMock()
+    with (
+        patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn) as ch,
+        patch(
+            "netmiko_mcp_linksys.connection.send_paged",
+            side_effect=lambda _conn, command: f"OUT:{command}",
+        ) as paged,
+    ):
+        result = port_overview()
+    ch.assert_called_once()
+    conn.disconnect.assert_called_once()
+    conn.send_config_set.assert_not_called()
+    assert [c.args for c in paged.call_args_list] == [
+        (conn, command) for command in PORT_OVERVIEW_COMMANDS
+    ]
+    sections = [f"=== {command} ===\nOUT:{command}" for command in PORT_OVERVIEW_COMMANDS]
+    assert result == "\n\n".join(sections)
+
+
+def test_port_overview_stops_after_failed_command(
+    reset_command_file: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    from netmiko_mcp_linksys.connection import SEQUENCE_SKIPPED
+    from netmiko_mcp_linksys.connection import ConnectionError as SwitchConnectionError
+    from netmiko_mcp_linksys.server import PORT_OVERVIEW_COMMANDS
+
+    password = os.environ["SWITCH_PASSWORD"]
+    monkeypatch.setenv("SWITCH_PAGING_OFF", "0")
+    conn = MagicMock()
+    first, second, third, fourth = PORT_OVERVIEW_COMMANDS
+    with (
+        patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn) as ch,
+        patch(
+            "netmiko_mcp_linksys.connection.send_paged",
+            side_effect=[
+                "INFO",
+                SwitchConnectionError(f"No prompt after {second!r} ({password})"),
+            ],
+        ) as paged,
+    ):
+        result = port_overview()
+    ch.assert_called_once()
+    assert paged.call_count == 2
+    assert result.startswith(f"=== {first} ===\nINFO")
+    assert "=== errors ===" in result
+    assert f"{second}: No prompt after" in result
+    assert f"{third}: {SEQUENCE_SKIPPED}" in result
+    assert f"{fourth}: {SEQUENCE_SKIPPED}" in result
+    assert password not in result
+
+
+def test_port_overview_unexpected_error_is_redacted(
+    reset_command_file: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    from netmiko_mcp_linksys.server import PORT_OVERVIEW_COMMANDS
+
+    password = os.environ["SWITCH_PASSWORD"]
+    monkeypatch.setenv("SWITCH_PAGING_OFF", "0")
+    conn = MagicMock()
+    with (
+        patch("netmiko_mcp_linksys.connection.ConnectHandler", return_value=conn),
+        patch(
+            "netmiko_mcp_linksys.connection.send_paged",
+            side_effect=OSError(f"socket closed {password}"),
+        ) as paged,
+    ):
+        result = port_overview()
+    paged.assert_called_once()
+    assert result.startswith("Error: ")
+    assert f"{PORT_OVERVIEW_COMMANDS[0]}: socket closed ***" in result
+    assert password not in result
+
+
+def test_port_overview_connect_failure_single_attempt(
+    reset_command_file: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+
+    from netmiko_mcp_linksys.server import PORT_OVERVIEW_COMMANDS
+
+    password = os.environ["SWITCH_PASSWORD"]
+    with patch(
+        "netmiko_mcp_linksys.connection.ConnectHandler",
+        side_effect=RuntimeError(f"auth failed for {password}"),
+    ) as ch:
+        result = port_overview()
+    ch.assert_called_once()
+    assert result.startswith("Error: ")
+    for command in PORT_OVERVIEW_COMMANDS:
+        assert f"{command}: auth failed for ***" in result
+    assert password not in result
+
+
 def test_port_overview_requires_command_file(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("NETMIKO_MCP_COMMAND_FILE", raising=False)
-    with patch("netmiko_mcp_linksys.server.run_show") as run:
+    with patch("netmiko_mcp_linksys.server.run_show_sequence") as run:
         result = port_overview()
     run.assert_not_called()
     assert "NETMIKO_MCP_COMMAND_FILE" in result

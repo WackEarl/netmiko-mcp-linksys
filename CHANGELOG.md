@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `port_overview` runs its four allow-listed show commands in a single SSH
+  session (same process-wide lock, same command filter, no config sent)
+  instead of opening one session per command. If a command fails inside
+  the session, the remaining commands are not sent (the channel state is
+  unknown) and are listed under `errors` as not run; output collected
+  before the failure is still returned. A connect failure is reported once
+  per command after a single connection attempt
+  ([#5](https://github.com/WackEarl/netmiko-mcp-linksys/issues/5)).
+
 ## [0.2.0] - 2026-11-13
 
 ### Added

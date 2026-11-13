@@ -33,6 +33,7 @@ from netmiko_mcp_linksys.connection import (
     run_in_session,
     run_save,
     run_show,
+    run_show_sequence,
     send_paged,
     session_log_path,
 )
@@ -219,7 +220,7 @@ def show(command: str) -> str:
 
 @mcp.tool()
 def port_overview() -> str:
-    """Read a bundle of allow-listed status commands in one session each.
+    """Read a bundle of allow-listed status commands in a single session.
 
     Read-only: runs only the hardcoded show commands through the same
     netmiko-mcp command filter as the show tool. Never sends config.
@@ -236,17 +237,24 @@ def port_overview() -> str:
     prepare_runtime()
     sections: list[str] = []
     errors: list[str] = []
+    allowed: list[tuple[str, str]] = []
     for command in PORT_OVERVIEW_COMMANDS:
         verdict = validate_command(command)
         if not verdict.allowed:
             errors.append(f"{command}: Command rejected: {verdict.reason}")
             continue
+        allowed.append((command, verdict.normalized_command))
+    if allowed:
         try:
-            output = run_show(verdict.normalized_command)
+            results = run_show_sequence([normalized for _, normalized in allowed])
         except (ValidationError, SwitchConnectionError) as exc:
-            errors.append(f"{command}: {redact_secrets(str(exc))}")
-            continue
-        sections.append(f"=== {command} ===\n{output}")
+            message = redact_secrets(str(exc))
+            results = [(normalized, None, message) for _, normalized in allowed]
+        for (command, _), (_, output, error) in zip(allowed, results, strict=True):
+            if error is not None:
+                errors.append(f"{command}: {redact_secrets(error)}")
+            else:
+                sections.append(f"=== {command} ===\n{output}")
     if errors and not sections:
         return _fail(
             "port_overview",

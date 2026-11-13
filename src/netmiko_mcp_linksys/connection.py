@@ -1,7 +1,8 @@
 """SSH session handling, pager handling, and CLI sequence builders.
 
 No connection is opened at import or process start. Each tool call opens one
-session, holds a process-wide lock for the duration, and disconnects after.
+session (port_overview included), holds a process-wide lock for the duration,
+and disconnects after.
 """
 
 from __future__ import annotations
@@ -382,6 +383,47 @@ def send_paged(
             )
         else:
             time.sleep(poll_interval)
+
+
+SEQUENCE_SKIPPED = "not run: an earlier command in the same session failed"
+
+
+def run_show_sequence(commands: list[str]) -> list[tuple[str, str | None, str | None]]:
+    """Run several exec commands in one session, in order.
+
+    Returns ``(command, output, error)`` per command; exactly one of output
+    and error is set. After the first failing command the remaining ones are
+    not sent (the channel state is unknown) and get ``SEQUENCE_SKIPPED``.
+    Connect failures raise ``ConnectionError`` / ``ValidationError`` as
+    ``run_show`` does. Callers must pass only filtered show commands.
+    """
+    results: list[tuple[str, str | None, str | None]] = []
+    # As run_shows: keep community / viewtree / user listings out of the
+    # netmiko session log.
+    enable_session_log = not any(_is_snmp_sensitive_show(command) for command in commands)
+    with session(enable_session_log=enable_session_log) as conn:
+        failed = False
+        for command in commands:
+            if failed:
+                results.append((command, None, SEQUENCE_SKIPPED))
+                continue
+            try:
+                results.append((command, _send_show(conn, command), None))
+            except ConnectionError as exc:
+                failed = True
+                results.append((command, None, redact_secrets(str(exc))))
+    return results
+
+
+def _send_show(conn: Any, command: str) -> str:
+    """send_paged_redacted (pager, secret and community redaction) with every
+    failure turned into a redacted ConnectionError."""
+    try:
+        return send_paged_redacted(conn, command)
+    except ConnectionError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - converted, redacted, re-raised (as run_show)
+        raise ConnectionError(redact_secrets(str(exc))) from None
 
 
 def build_admin_state_commands(port: str, enabled: bool) -> list[str]:

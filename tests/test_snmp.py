@@ -2694,3 +2694,36 @@ def test_port_0_15_is_not_locked(monkeypatch: pytest.MonkeyPatch) -> None:
     ) as run:
         assert poe_set("0/15", False) == "done"
     run.assert_called_once()
+
+
+def test_run_show_sequence_redacts_like_run_show(
+    community_env: str, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5 on 0.2.0: run_show_sequence uses send_paged_redacted and keeps
+    SNMP listings out of the session log, as run_show / run_shows do."""
+    from netmiko_mcp_linksys import connection
+
+    monkeypatch.setenv("SWITCH_SESSION_LOG", str(tmp_path / "session.log"))
+    captured: list[dict[str, Any]] = []
+
+    def fake_handler(**params: Any) -> _FakeConn:
+        captured.append(dict(params))
+        return _FakeConn("ok")
+
+    def fake_paged(_conn: Any, command: str, *_a: Any, **_k: Any) -> str:
+        return {"show snmp community": COMMUNITY_SHOW}.get(command, f"User Name: {SECRET}")
+
+    with (
+        patch.object(connection, "ConnectHandler", fake_handler),
+        patch.object(connection, "disable_paging_best_effort", lambda _c: None),
+        patch.object(connection, "send_paged", fake_paged),
+    ):
+        results = connection.run_show_sequence(["show snmp community", "show system information"])
+        assert "session_log" not in captured[-1]
+        plain = connection.run_show_sequence(["show system information"])
+        assert "session_log" in captured[-1]
+    for _command, output, error in results + plain:
+        assert error is None
+        assert output is not None
+        assert not _secret_in(output, SECRET)
+        assert "[REDACTED]" in output
